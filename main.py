@@ -1,14 +1,37 @@
 """
-main.py
--------
-Entry point. Starts scanner loop AND listens for Telegram commands.
+main.py - Entry point for trading scanner.
+Handles import regardless of folder nesting.
 """
 
+import sys
+import os
 import threading
 import time
 import requests
-import os
-from scanner.scanner import Scanner
+
+# ── Fix import path regardless of folder structure ──────────
+# This makes Python find the scanner module whether files are
+# at /app/scanner/ or /app/scanner/scanner/
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
+
+# Also add parent directory in case of nesting
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
+# Try importing Scanner — handle both flat and nested structures
+try:
+    from scanner.scanner import Scanner
+    print("[MAIN] Imported Scanner from scanner.scanner")
+except ImportError:
+    try:
+        from scanner import Scanner
+        print("[MAIN] Imported Scanner from scanner directly")
+    except ImportError as e:
+        print(f"[MAIN] Import failed: {e}")
+        print(f"[MAIN] Python path: {sys.path}")
+        print(f"[MAIN] Files in current dir: {os.listdir(current_dir)}")
+        raise
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 
@@ -39,7 +62,6 @@ def listen_for_commands(scanner_instance):
 if __name__ == "__main__":
     scanner = Scanner()
 
-    # Start Telegram command listener in background
     cmd_thread = threading.Thread(
         target=listen_for_commands,
         args=(scanner,),
@@ -48,5 +70,4 @@ if __name__ == "__main__":
     cmd_thread.start()
     print("[MAIN] Telegram command listener started.")
 
-    # Start main scanner loop
     scanner.run()
