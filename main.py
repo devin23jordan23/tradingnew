@@ -41,33 +41,71 @@ def _refresh(t):
     if "refresh_token" not in n: n["refresh_token"]=t.get("refresh_token")
     _save(n); return n
 
-_auth_code=None
-class _CB(BaseHTTPRequestHandler):
-    def do_GET(self):
-        global _auth_code
-        p=parse_qs(urlparse(self.path).query)
-        if "code" in p:
-            _auth_code=p["code"][0]; self.send_response(200); self.end_headers()
-            self.wfile.write(b"<h2 style='color:green'>Auth done! Close tab.</h2>")
-        else: self.send_response(400); self.end_headers()
-    def log_message(self,*a): pass
+# ── CLOUD AUTH — manual URL paste via Telegram ───────────────
+# Railway runs in the cloud so 127.0.0.1 redirect cannot be caught
+# automatically. Instead: bot sends you the login URL, you log in,
+# then paste the full redirect URL back to the bot as /auth <url>
+# This happens only once — tokens are saved forever after.
+
+_pending_auth = False   # True while waiting for you to paste the URL
 
 def _login():
-    global _auth_code; _auth_code=None
-    url=f"{AUTH_URL}?{urlencode({'response_type':'code','client_id':SCHWAB_CLIENT_ID,'redirect_uri':REDIRECT,'scope':'readonly'})}"
-    print(f"SCHWAB LOGIN: {url}"); send_telegram(f"🔐 <b>Login Required</b>\n<code>{url}</code>")
-    threading.Thread(target=lambda:HTTPServer(("127.0.0.1",443),_CB).handle_request(),daemon=True).start()
-    start=time.time()
-    while _auth_code is None:
-        if time.time()-start>300: raise TimeoutError("timeout")
-        time.sleep(1)
-    h={"Authorization":f"Basic {_b64()}","Content-Type":"application/x-www-form-urlencoded"}
-    r=requests.post(TOKEN_URL,headers=h,data={"grant_type":"authorization_code","code":_auth_code,"redirect_uri":REDIRECT},timeout=15)
-    r.raise_for_status(); t=r.json(); _save(t); return t
+    global _pending_auth
+    _pending_auth = True
+    url = f"{AUTH_URL}?{urlencode({'response_type':'code','client_id':SCHWAB_CLIENT_ID,'redirect_uri':REDIRECT,'scope':'readonly'})}"
+    print(f"[AUTH] Login required. URL: {url}")
+    send_telegram(
+        f"🔐 <b>Schwab Authorization Required</b>\n"
+        f"{'━'*30}\n"
+        f"<b>Step 1:</b> Open this link in your browser:\n"
+        f"<code>{url}</code>\n\n"
+        f"<b>Step 2:</b> Log in with your Schwab account\n\n"
+        f"<b>Step 3:</b> After logging in, your browser will show a blank page or error.\n"
+        f"Copy the <b>entire URL</b> from your browser address bar\n"
+        f"(it starts with https://127.0.0.1/?code=...)\n\n"
+        f"<b>Step 4:</b> Send it to me like this:\n"
+        f"<code>/auth https://127.0.0.1/?code=PASTE_FULL_URL_HERE</code>"
+    )
+    # Wait up to 10 minutes for /auth command
+    start = time.time()
+    while _pending_auth:
+        if time.time() - start > 600:
+            send_telegram("⏰ Auth timed out. Will retry in 5 minutes.")
+            return None
+        time.sleep(2)
+    return _load()
+
+def _complete_auth(full_redirect_url):
+    """Called when user sends /auth <full_redirect_url>"""
+    global _pending_auth
+    try:
+        parsed = urlparse(full_redirect_url)
+        params = parse_qs(parsed.query)
+        code   = params.get("code", [None])[0]
+        if not code:
+            send_telegram("❌ Could not find auth code in that URL. Make sure you copied the full URL.")
+            return False
+        h = {"Authorization":f"Basic {_b64()}","Content-Type":"application/x-www-form-urlencoded"}
+        r = requests.post(TOKEN_URL, headers=h,
+                          data={"grant_type":"authorization_code","code":code,"redirect_uri":REDIRECT},
+                          timeout=15)
+        r.raise_for_status()
+        t = r.json()
+        _save(t)
+        _pending_auth = False
+        send_telegram("✅ <b>Schwab connected successfully!</b>\nYour scanner is now live. You won't need to do this again.")
+        print("[AUTH] Tokens saved successfully.")
+        return True
+    except Exception as e:
+        send_telegram(f"❌ Auth failed: {e}\n\nTry sending /reauth to start again.")
+        print(f"[AUTH ERROR] {e}")
+        return False
 
 def tok():
     t=_load()
-    if not t: t=_login()
+    if not t:
+        t=_login()
+        if not t: return ""
     elif _expired(t): t=_refresh(t)
     return t.get("access_token","")
 
@@ -379,8 +417,15 @@ class Scanner:
             t=pts[1].upper(); self.obs[t]=(float(pts[2]),float(pts[3])); send_telegram(f"🧱 OB set {t}: ${pts[2]}–${pts[3]}")
         elif c=="/earnings" and len(pts)==2:
             t=pts[1].upper(); self.earnings.add(t); send_telegram(f"📋 {t} flagged earnings")
+        elif c=="/auth" and len(pts)>=2:
+            full_url=" ".join(pts[1:])
+            _complete_auth(full_url)
+        elif c=="/reauth":
+            _save({})  # clear tokens
+            send_telegram("🔄 Tokens cleared. Starting fresh auth...")
+            threading.Thread(target=_login,daemon=True).start()
         else:
-            send_telegram("Commands:\n/watch TICKER\n/remove TICKER\n/list\n/status\n/setups\n/threshold 65\n/ob TICKER LOW HIGH\n/earnings TICKER")
+            send_telegram("Commands:\n/watch TICKER\n/remove TICKER\n/list\n/status\n/setups\n/threshold 65\n/ob TICKER LOW HIGH\n/earnings TICKER\n/reauth")
     def run(self):
         print("[SCANNER] v3.0 starting — 11 setups")
         send_telegram(f"🤖 <b>Scanner v3.0 Online</b>\n{'━'*28}\nWatching <b>{len(self.wl)} stocks</b> | 11 setups | Score ≥{MIN_SCORE}/100\n{'━'*28}\nORB L/S · PM High/Low Retest · VWAP Reclaim/Reject · 9 EMA PB L/S · Flag · PDH/PDL Retest\n\nCommands: /status /setups /watch /remove /list /threshold /ob /earnings")
