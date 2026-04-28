@@ -1,4 +1,3 @@
-
 """
 main.py - Andre's Trading Scanner v3.3
 Single-file deployment.
@@ -304,9 +303,12 @@ def candles(ticker: str, m: int = 5):
 
 def price(ticker: str):
     try:
-        d = _get(f"/quotes/{ticker}")
+        # Schwab quotes API requires symbol as query param, not URL path
+        # Correct: /quotes?symbols=NVDA
+        # Wrong:   /quotes/NVDA  (returns 404)
+        d = _get("/quotes", {"symbols": ticker})
         q = d.get(ticker, {}).get("quote", {})
-        return q.get("lastPrice") or q.get("mark")
+        return q.get("lastPrice") or q.get("mark") or q.get("closePrice")
     except Exception:
         return None
 
