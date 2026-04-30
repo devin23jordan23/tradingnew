@@ -1,54 +1,96 @@
 """
-main.py - Andre's Trading Scanner v3.6
+main.py — Andre's Trading Scanner v3.9
 
-CHANGES FROM v3.5 — QUALITY LAYER + FIB PULLBACK
-──────────────────────────────────────────────────
+CHANGES FROM v3.6
+─────────────────────────────────────────────────────────────────
 
-What changed and why:
+1. EMA DIRECTION CONTEXT — "FROM ABOVE vs FROM BELOW" GATE
+   Root bug: EMA9 pullback longs were firing when price had been
+   BELOW the EMA for 10-15+ minutes and then just touched it from
+   underneath — a resistance test, not a support pullback. Opposite
+   setups were conflated.
 
-1. RELATIVE VOLUME (RVOL) GATE
-   Every setup now checks RVOL before firing. If the stock isn't
-   showing elevated volume relative to its norm, the move isn't
-   institutional — it's noise. Gate: RVOL >= 1.5x to qualify,
-   scored bonus at 2x+. Calculated from today's volume vs the
-   average volume of the same time window on prior days.
+   Fix: Every EMA setup now classifies the prior price position:
+   - PULLBACK LONG: price must have been ABOVE the EMA for the last
+     N bars before the touch. Minimum 3 bars above, no more than
+     2 bars below allowed before the touch.
+   - PULLBACK SHORT: price must have been BELOW the EMA for the last
+     N bars before the bounce. Same rule inverted.
+   - "Bars above/below EMA" is now reported in alert notes.
 
-2. RELATIVE STRENGTH vs SPY
-   SPY is fetched once per cycle (not per ticker — one call).
-   Every LONG setup gets a RS check: is this stock outperforming
-   SPY on the session? Weak RS on a long = score penalty.
-   Strong RS = score bonus. Does not block setups — just adjusts
-   the score so you can see context in the alert.
+2. ATR-NORMALIZED RELATIVE STRENGTH
+   Root bug: raw % diff vs SPY missed GOOGL-type setups where a
+   stock is up 0.8% when SPY is up 0.5% — looks neutral (+0.3%)
+   but GOOGL's daily ATR is ~1.5% so 0.8% is actually 53% of its
+   range — genuinely strong for that name.
 
-3. TIME-OF-DAY SCORE MODIFIER
-   Same setup at 9:45 vs 12:30 is not the same setup. Score is
-   now adjusted by time window:
-     9:30–10:30 → +5  (prime momentum window)
-     10:30–12:00 → 0  (neutral, selective)
-     12:00–14:00 → -8 (chop risk, raise bar)
-     14:00–16:00 → +3 (continuation / power hour)
+   Fix: RS now uses ATR-normalized moves:
+     ticker_rs = ticker_pct / ticker_atr_pct
+     spy_rs    = spy_pct    / spy_atr_pct
+     diff      = ticker_rs  - spy_rs
+   A stock moving 70% of its ATR when SPY moves 40% of its ATR
+   is clearly outperforming on a normalized basis regardless of
+   whether the raw % numbers look close.
+   SPY ATR cached once per cycle alongside SPY pct.
 
-4. FIB PULLBACK SETUP (LONG + SHORT)
-   New setup: after a strong qualifying impulse leg, watch the
-   38.2%, 50%, and 61.8% retracement levels for a bounce.
-   Requirements:
-   - Impulse leg: min 1.5x ATR, min 3 bars, volume above avg
-   - RVOL >= 1.5x on the name (in-play filter)
-   - Volume contracting on pullback (healthy retracement, not distribution)
-   - Price within 0.4% of a Fib level
-   - EMA9 or VWAP confluence within 0.5% of the Fib level = bonus
-   - Anchors: largest intraday impulse leg (low→high for longs,
-     high→low for shorts)
-   Levels: 38.2% (shallow/strong), 50% (most watched), 61.8%
-   (last line of defense). 50% scores highest.
+3. VOLUME BASELINE FIX — SESSION ANCHOR NOT ROLLING
+   Root bug: av() computed rolling average over last 20 bars.
+   A stock ranging for 90 min suppresses its own vol average,
+   making flat current volume look "above average." Result: rangebound
+   names touching an EMA triggered volume-confirmed alerts.
 
-5. SCORE FLOOR RAISED SLIGHTLY
-   With the new quality layers in place, the effective quality
-   bar is higher even at MIN_SCORE=60 because RVOL failures
-   and RS penalties will drop marginal setups below threshold.
-   No code change needed — the modifiers handle it naturally.
+   Fix: vol_baseline() computes average from the FIRST N bars of the
+   session (opening pace), not the rolling last 20. Current volume
+   is compared to what the stock was doing at the open, not what
+   it's been doing during the chop.
 
-Nothing removed. All v3.5 setups and state management intact.
+   av() still exists for non-volume-gate uses (flag range, etc.)
+   vol_baseline() replaces it in all setup volume checks.
+
+4. EMA RIDER SETUP — CATCHING RUNNERS ON 10-MIN 4 EMA
+   New setup: EMA4_10M_RIDER_LONG / SHORT.
+   Catches stocks in a strong directional trend by watching the
+   4 EMA on the 10-minute chart. Requires:
+   - 4 EMA on 10-min is clearly sloped (trending, not flat)
+   - Price is riding ABOVE (long) or BELOW (short) the 4 EMA
+   - Price pulls back to touch or come within 0.3% of the 4 EMA
+   - Volume on pullback bars is contracting (healthy, not distributing)
+   - At least 4 consecutive bars have held the 4 EMA side (trend confirmed)
+   - RVOL > 1.5x (name must be in play, not just any slow grind)
+   This catches your runner scenario: stock that's been trending
+   for 30-60 min and pulls back gently to the 4 EMA before continuation.
+   Alert says: "Riding 4 EMA on 10-min — pullback to touch."
+
+5. EMA9 ON 5-MIN AND 10-MIN — MULTI-TIMEFRAME
+   Added ema9_pb_long_10m / ema9_pb_short_10m: same logic as the
+   5-min version but evaluated on 10-min closed bars.
+   10-min EMA9 pullbacks are higher-quality setups (more confirmation,
+   less noise) and score 5 pts higher base. They require more bars
+   above/below before the touch (5 bars vs 3 bars on 5-min).
+
+   The 2-min EMA setup is intentionally NOT added as a standalone
+   alert — too many false signals as you flagged. The 2-min is used
+   internally in the sweep logic only (already there).
+
+6. /REMOVE BUG FIXED
+   Root bug: self.wl comparison used direct string match which is
+   case-sensitive. If the ticker was stored with different casing
+   or had trailing whitespace from Telegram input, the match failed
+   silently. Now normalizes all inputs and the list comprehension
+   uses explicit .upper() comparison throughout.
+
+7. trigger_bar_ts NONE GUARD
+   Root bug: some setups returned trigger_bar_ts=None (e.g. when
+   r[-1] didn't exist or candles were empty). The should_fire()
+   check was then comparing None == None = True, blocking future
+   valid signals on that ticker/setup pair.
+   Fix: if trigger_bar_ts is None, dedup skips the bar comparison
+   and falls through to time-gap check only. Also added explicit
+   guard in every setup function.
+
+8. RS LABEL IN ALERT ALWAYS VISIBLE
+   Previously the RS label was appended to notes which got truncated.
+   Now it has its own dedicated line in the alert format.
 """
 
 import os
@@ -68,10 +110,11 @@ import requests
 # ENV / GLOBALS
 # ──────────────────────────────────────────────────────────────
 
-SCHWAB_CLIENT_ID    = os.environ.get("SCHWAB_CLIENT_ID", "")
+SCHWAB_CLIENT_ID     = os.environ.get("SCHWAB_CLIENT_ID", "")
 SCHWAB_CLIENT_SECRET = os.environ.get("SCHWAB_CLIENT_SECRET", "")
-TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN       = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
+DISCORD_WEBHOOK_URL  = os.environ.get("DISCORD_WEBHOOK_URL", "")  # optional — leave blank to disable
 
 ET        = pytz.timezone("America/New_York")
 AUTH_URL  = "https://api.schwabapi.com/v1/oauth/authorize"
@@ -87,7 +130,7 @@ DEFAULT_WATCHLIST = [
 ]
 
 MIN_SCORE = 60
-COOLDOWN  = 15  # legacy — overridden by per-bar dedup + TTL
+COOLDOWN  = 15
 
 # Timing windows
 ORB_5M_CUTOFF  = (9, 45)
@@ -96,7 +139,7 @@ ORB_15M_CUTOFF = (10, 5)
 HOD_START      = (10, 15)
 HOD_END        = (15, 30)
 
-# Sweep cooldowns (legacy)
+# Sweep cooldowns
 SWEEP_WATCH_COOLDOWN   = 10
 SWEEP_ACTIVE_COOLDOWN  = 5
 SWEEP_RECLAIM_COOLDOWN = 10
@@ -111,6 +154,10 @@ SIGNAL_TTL = {
     "VWAP_REJECT_SHORT":        15,
     "EMA9_5M_PULLBACK_LONG":    12,
     "EMA9_5M_PULLBACK_SHORT":   12,
+    "EMA9_10M_PULLBACK_LONG":   18,
+    "EMA9_10M_PULLBACK_SHORT":  18,
+    "EMA4_10M_RIDER_LONG":      20,
+    "EMA4_10M_RIDER_SHORT":     20,
     "FLAG_BREAKOUT_LONG":       18,
     "PDH_BREAK_RETEST_LONG":    30,
     "PDL_BREAK_RETEST_SHORT":   30,
@@ -125,14 +172,28 @@ DEFAULT_TTL = 15
 
 MIN_REFIRE_GAP_MIN = 20
 
-# ── NEW: Quality layer constants ──
-RVOL_MIN       = 1.5   # minimum RVOL to qualify any setup
-RVOL_STRONG    = 2.0   # RVOL above this scores a bonus
-FIB_LEVELS     = [0.382, 0.50, 0.618]   # standard retracement levels
-FIB_TOLERANCE  = 0.004  # price must be within 0.4% of a fib level
-FIB_CONFLUENCE = 0.005  # EMA/VWAP within 0.5% of fib = confluence bonus
-FIB_MIN_ATR_MULT = 1.5  # impulse must be >= 1.5x ATR to qualify
-FIB_MIN_BARS   = 3      # impulse must span at least this many bars
+# Quality layer constants
+RVOL_MIN       = 1.5
+RVOL_STRONG    = 2.0
+FIB_LEVELS     = [0.382, 0.50, 0.618]
+FIB_TOLERANCE  = 0.004
+FIB_CONFLUENCE = 0.005
+FIB_MIN_ATR_MULT = 1.5
+FIB_MIN_BARS   = 3
+
+# EMA direction context — bars price must have spent on correct side
+# before a touch is considered a valid pullback (not a resistance test)
+EMA_PRIOR_BARS_5M  = 3   # at least 3 bars above EMA before touch (5-min)
+EMA_PRIOR_BARS_10M = 5   # at least 5 bars above EMA before touch (10-min)
+EMA_MAX_CROSS_BARS = 2   # allow at most this many bars on wrong side in window
+
+# Volume baseline window — use first N session bars as reference pace
+VOL_BASELINE_BARS = 8    # first 8 bars = first 40 min of session on 5-min chart
+
+# 10-min 4 EMA rider thresholds
+EMA4_SLOPE_MIN    = 0.0003  # minimum per-bar slope as fraction of price (0.03%)
+EMA4_TOUCH_PCT    = 0.003   # within 0.3% of 4 EMA counts as "touching"
+EMA4_MIN_BARS     = 4       # at least 4 bars trending on correct side of 4 EMA
 
 WATCHLIST_FILE = "watchlist_state.json"
 ARMED_FILE     = "armed_state.json"
@@ -162,6 +223,48 @@ def in_window(ts, sh, sm, eh, em):
 
 def clamp_score(v):
     return max(0, min(int(v), 100))
+
+
+def _strip_html(msg):
+    """
+    Discord doesn't render Telegram HTML tags.
+    Strip <b> bold tags and convert to Discord markdown (**bold**).
+    Also strip any other HTML so the message reads cleanly.
+    """
+    import re
+    msg = re.sub(r"<b>(.*?)</b>", r"**\1**", msg)
+    msg = re.sub(r"<[^>]+>", "", msg)
+    return msg
+
+
+def send_discord(msg):
+    """
+    Forward alert to Discord via webhook.
+    Silently skips if DISCORD_WEBHOOK_URL is not set.
+    Discord has a 2000 char limit — truncates gracefully if needed.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        clean = _strip_html(msg)
+        if len(clean) > 1950:
+            clean = clean[:1950] + "\n…"
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": clean, "username": "Andre Scanner"},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[DISCORD ERR] {e}")
+
+
+def send_alert(msg):
+    """
+    Send to both Telegram and Discord in one call.
+    Use this everywhere instead of calling send_telegram directly.
+    """
+    send_telegram(msg)
+    send_discord(msg)
 
 
 def send_telegram(msg):
@@ -280,7 +383,7 @@ def _complete_auth(full_redirect_url):
         _save_tokens(t)
         _pending_auth = False
         send_telegram("✅ <b>Schwab connected successfully!</b>")
-        print("[AUTH] Tokens saved successfully.")
+        print("[AUTH] Tokens saved.")
         return True
     except Exception as e:
         print(f"[AUTH ERROR] {e}")
@@ -363,9 +466,33 @@ def rh(cs):
 
 
 def av(cs, n=20):
+    """Rolling average volume — used for non-gate purposes (flag range etc.)"""
     r = rh(cs)
     vols = [c["v"] for c in r[-n:]]
     return sum(vols) / len(vols) if vols else None
+
+
+def vol_baseline(cs, n=VOL_BASELINE_BARS):
+    """
+    Session-anchored volume baseline.
+    Uses the FIRST n bars of the session as the reference pace,
+    not the rolling recent average. This prevents rangebound names
+    from suppressing their own average and then triggering on flat volume.
+
+    Returns (baseline_avg, recent_avg, ratio):
+      ratio > 1.0 = current pace is faster than opening pace
+      ratio < 0.8 = current pace is contracting vs opening
+    """
+    r = rh(cs)
+    if len(r) < n + 2:
+        return None, None, None
+    base   = r[:n]
+    recent = r[-3:]    # last 3 bars = current pace
+    base_avg   = sum(c["v"] for c in base)   / len(base)
+    recent_avg = sum(c["v"] for c in recent) / len(recent)
+    if base_avg == 0:
+        return None, None, None
+    return base_avg, recent_avg, round(recent_avg / base_avg, 2)
 
 
 def vwap(cs):
@@ -378,16 +505,6 @@ def vwap(cs):
         total_val += tp * c["v"]
         total_vol += c["v"]
     return total_val / total_vol if total_vol else None
-
-
-def ema(vals, p=9):
-    if len(vals) < p:
-        return None
-    k = 2 / (p + 1)
-    e = sum(vals[:p]) / p
-    for v in vals[p:]:
-        e = v * k + e * (1 - k)
-    return e
 
 
 def ema_series(vals, p=9):
@@ -409,11 +526,6 @@ def opening_range(c1m, minutes=5):
     if not bars:
         return None, None
     return max(c["h"] for c in bars), min(c["l"] for c in bars)
-
-
-def intraday_high(cs):
-    r = rh(cs)
-    return max(c["h"] for c in r) if r else None
 
 
 def _pm_candles(ticker):
@@ -470,30 +582,18 @@ def prior_day(ticker):
 
 
 # ──────────────────────────────────────────────────────────────
-# NEW: QUALITY LAYER HELPERS
+# QUALITY LAYER HELPERS
 # ──────────────────────────────────────────────────────────────
 
 def calc_rvol(c5, baseline_bars=10):
     """
-    Relative volume: compares the recent pace of volume to the opening
-    session baseline. This correctly detects acceleration and deceleration.
-
-    Method: use the first `baseline_bars` bars as the "normal" session pace.
-    Compare the most recent 5 bars' average to that baseline.
-    A ratio of 2.0 means current pace is running 2x the opening average —
-    the stock is accelerating, likely in play.
-
-    Why not use a simple total/average approach: that method is self-normalizing
-    and always returns ~1.0 because the average includes the current bars.
-    This approach anchors to the opening baseline, which is stable.
-
-    Requires at least 6 regular-hours bars to calculate.
+    Session-anchored RVOL. Compares recent 5-bar avg volume to
+    the first baseline_bars bars of the session.
     """
     r = rh(c5)
     if len(r) < 6:
         return None
-    # Use first 10 bars (or half of available) as the baseline
-    base = r[:baseline_bars] if len(r) >= baseline_bars else r[:max(3, len(r) // 2)]
+    base   = r[:baseline_bars] if len(r) >= baseline_bars else r[:max(3, len(r) // 2)]
     recent = r[-5:]
     base_avg   = sum(c["v"] for c in base)   / len(base)   if base   else 0
     recent_avg = sum(c["v"] for c in recent) / len(recent) if recent else 0
@@ -503,63 +603,32 @@ def calc_rvol(c5, baseline_bars=10):
 
 
 def atr(cs, n=10):
-    """Average True Range over last n bars."""
     r = rh(cs)
     if len(r) < 2:
         return None
     trs = []
     for i in range(1, len(r)):
         prev_c = r[i - 1]["c"]
-        high   = r[i]["h"]
-        low    = r[i]["l"]
-        trs.append(max(high - low, abs(high - prev_c), abs(low - prev_c)))
+        trs.append(max(r[i]["h"] - r[i]["l"],
+                       abs(r[i]["h"] - prev_c),
+                       abs(r[i]["l"] - prev_c)))
     recent = trs[-n:]
     return sum(recent) / len(recent) if recent else None
 
 
 def time_of_day_modifier():
-    """
-    Score adjustment based on time of day.
-    Prime window gets a bonus. Chop window gets a penalty.
-    Keeps it honest — the same pattern at noon should score lower.
-    """
     ts = now_et()
     if in_window(ts, 9, 30, 10, 30):
-        return +5   # prime momentum window
+        return +5
     elif in_window(ts, 10, 30, 12, 0):
-        return 0    # selective but neutral
+        return 0
     elif in_window(ts, 12, 0, 14, 0):
-        return -8   # chop risk — raise effective bar
+        return -8
     else:
-        return +3   # 14:00–16:00 continuation / power hour
-
-
-def relative_strength_vs_spy(ticker_pct, spy_pct):
-    """
-    Simple RS: how much is the ticker outperforming SPY?
-    Returns a score modifier and a label.
-    ticker_pct / spy_pct = session % change for each.
-    """
-    if spy_pct is None or ticker_pct is None:
-        return 0, "RS: N/A"
-    diff = ticker_pct - spy_pct
-    if diff >= 1.5:
-        return +10, f"RS: Strong +{round(diff, 1)}% vs SPY ✅"
-    elif diff >= 0.5:
-        return +5,  f"RS: Good +{round(diff, 1)}% vs SPY"
-    elif diff >= -0.3:
-        return 0,   f"RS: Neutral {round(diff, 1)}% vs SPY"
-    elif diff >= -1.0:
-        return -5,  f"RS: Weak {round(diff, 1)}% vs SPY ⚠️"
-    else:
-        return -10, f"RS: Lagging {round(diff, 1)}% vs SPY ❌"
+        return +3
 
 
 def session_pct_change(c5):
-    """
-    Session % change from open to current close.
-    Used for RS calculation.
-    """
     r = rh(c5)
     if not r:
         return None
@@ -570,89 +639,270 @@ def session_pct_change(c5):
     return round((current - open_price) / open_price * 100, 2)
 
 
+def atr_pct(cs, n=10):
+    """ATR as a percentage of current price — for normalization."""
+    r = rh(cs)
+    if not r:
+        return None
+    atr_val = atr(cs, n)
+    p_val   = r[-1]["c"]
+    if not atr_val or not p_val:
+        return None
+    return round(atr_val / p_val * 100, 3)
+
+
+def recent_direction(cs, lookback=4):
+    """
+    Classify the most recent directional trend of a candle series.
+    Uses the last `lookback` closed bars to determine:
+      "up"    — net move is clearly positive (> +0.05% of price)
+      "down"  — net move is clearly negative (< -0.05% of price)
+      "flat"  — oscillating within noise band
+    This answers "what is SPY/ticker doing RIGHT NOW" vs session pct
+    which can be stale from an early-session move hours ago.
+    """
+    r = rh(cs)
+    if len(r) < lookback + 1:
+        return "flat"
+    window = r[-(lookback + 1):]
+    start  = window[0]["c"]
+    end    = window[-1]["c"]
+    if not start:
+        return "flat"
+    move_pct = (end - start) / start * 100
+    if move_pct >= 0.08:
+        return "up"
+    elif move_pct <= -0.08:
+        return "down"
+    return "flat"
+
+
+def build_spy_context(spy_c5):
+    """
+    Build a full SPY context object from candle data.
+    Called once per scan cycle, results shared across all tickers.
+    Returns a dict with session_pct, atr_pct_val, and recent_dir.
+    """
+    return {
+        "session_pct": session_pct_change(spy_c5),
+        "atr_pct":     atr_pct(spy_c5),
+        "recent_dir":  recent_direction(spy_c5, lookback=4),
+    }
+
+
+def grade_rs(ticker_pct, ticker_atr_pct, ticker_recent_dir, spy_ctx, direction="long"):
+    """
+    Full direction-aware relative strength grading system.
+
+    Three-layer scoring (applied in order, highest tier wins):
+
+    LAYER 1 — Directional Divergence (most powerful signal)
+    ─────────────────────────────────────────────────────────
+    Ticker going UP while SPY going DOWN (or vice versa for shorts)
+    = institutional conviction trade. Market is wrong or they know
+    something. This is your GOOGL-while-SPY-sells signal.
+    Score: +15 flat. Grade: A+ RS.
+
+    LAYER 2 — Same direction, ATR-normalized outperformance
+    ─────────────────────────────────────────────────────────
+    Both going same way, but ticker using more of its ATR than SPY.
+    GOOGL up 0.8% (53% of 1.5% ATR) vs SPY up 0.5% (100% of 0.5% ATR)
+    → SPY actually stronger normalized. Pure raw % diff misses this.
+    Score: +5 to +10 based on normalized spread.
+
+    LAYER 3 — Directional alignment (weakest positive signal)
+    ─────────────────────────────────────────────────────────
+    Same direction, similar pace — market is doing most of the work.
+    Score: 0 to +3. Setup still valid but RS adds no edge.
+
+    PENALTIES
+    ─────────────────────────────────────────────────────────
+    Ticker lagging SPY: -5 to -10. Forces score below threshold
+    on marginal setups. Strong setups still fire but get noted.
+
+    Parameters:
+      ticker_pct        — session % change (open to now)
+      ticker_atr_pct    — ticker ATR as % of price
+      ticker_recent_dir — "up" / "down" / "flat" (last 4 bars)
+      spy_ctx           — dict from build_spy_context()
+      direction         — "long" or "short" (inverts RS for shorts)
+
+    Returns: (score_modifier: int, grade_label: str, rs_tier: str)
+      rs_tier: "A+" / "A" / "B" / "C" / "D" — used for alert formatting
+    """
+    spy_pct    = spy_ctx.get("session_pct")
+    spy_atr    = spy_ctx.get("atr_pct")
+    spy_dir    = spy_ctx.get("recent_dir", "flat")
+
+    if spy_pct is None or ticker_pct is None:
+        return 0, "RS: N/A", "?"
+
+    tkr_pct  = ticker_pct
+    raw_diff = tkr_pct - spy_pct
+
+    # For shorts, strong RS means the ticker is WEAKER than SPY
+    if direction == "short":
+        ticker_recent_dir = "down" if ticker_recent_dir == "up" else (
+                            "up"   if ticker_recent_dir == "down" else "flat")
+        spy_dir_for_short = "down" if spy_dir == "up" else (
+                            "up"   if spy_dir == "down" else "flat")
+        raw_diff = -raw_diff
+        spy_dir  = spy_dir_for_short
+
+    # ─── LAYER 1: Counter-trend / directional divergence ───
+    # Ticker going UP, SPY going DOWN (within recent 4 bars)
+    counter_trend = (ticker_recent_dir == "up" and spy_dir == "down")
+    with_trend_spy_down = (ticker_recent_dir == "up" and spy_dir == "flat" and spy_pct < -0.15)
+
+    if counter_trend or with_trend_spy_down:
+        spy_move   = round(spy_pct, 2)
+        tkr_move   = round(tkr_pct, 2)
+        spy_str    = f"SPY {spy_move:+.2f}%"
+        tkr_str    = f"ticker {tkr_move:+.2f}%"
+        label = (f"⚡ Counter-trend RS | {tkr_str} vs {spy_str} | "
+                 f"SPY {'selling' if spy_dir == 'down' else 'flat/weak'} — institutional")
+        return +15, label, "A+"
+
+    # ─── LAYER 2: Same direction, ATR-normalized comparison ───
+    if ticker_atr_pct and spy_atr and ticker_atr_pct > 0 and spy_atr > 0:
+        ticker_norm = tkr_pct / ticker_atr_pct
+        spy_norm    = spy_pct / spy_atr
+        norm_diff   = ticker_norm - spy_norm
+        raw_str     = f"{raw_diff:+.1f}% raw"
+        norm_str    = f"{norm_diff:+.2f}x norm"
+
+        if norm_diff >= 0.5:
+            return +10, f"RS: Strong | {raw_str} | {norm_str} ✅", "A"
+        elif norm_diff >= 0.15:
+            return +5,  f"RS: Good | {raw_str} | {norm_str}", "B"
+        elif norm_diff >= -0.15:
+            return 0,   f"RS: Neutral | {raw_str} | {norm_str}", "B"
+        elif norm_diff >= -0.5:
+            return -5,  f"RS: Weak | {raw_str} | {norm_str} ⚠️", "C"
+        else:
+            return -12, f"RS: Lagging | {raw_str} | {norm_str} ❌", "D"
+
+    # ─── LAYER 3: Fallback — raw % diff only ───
+    if raw_diff >= 1.0:
+        return +8,  f"RS: Strong +{round(raw_diff,1)}% vs SPY ✅", "A"
+    elif raw_diff >= 0.3:
+        return +4,  f"RS: Good +{round(raw_diff,1)}% vs SPY", "B"
+    elif raw_diff >= -0.2:
+        return 0,   f"RS: Neutral {round(raw_diff,1)}% vs SPY", "B"
+    elif raw_diff >= -0.8:
+        return -5,  f"RS: Weak {round(raw_diff,1)}% vs SPY ⚠️", "C"
+    else:
+        return -10, f"RS: Lagging {round(raw_diff,1)}% vs SPY ❌", "D"
+
+
 # ──────────────────────────────────────────────────────────────
-# NEW: FIB RETRACEMENT HELPERS
+# EMA DIRECTION CONTEXT HELPERS
+# ──────────────────────────────────────────────────────────────
+
+def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROSS_BARS):
+    """
+    Classify whether price approached the EMA from ABOVE or BELOW,
+    and whether the approach is valid for a pullback setup.
+
+    For a LONG pullback to be valid:
+    - Price must have been ABOVE the EMA for at least prior_bars_required
+      of the last (prior_bars_required + max_cross_bars) bars
+    - The recent touch/cross should be the first (or at most second)
+      bar breaking the EMA from above
+
+    Returns:
+      "from_above"  — valid for long pullback setup
+      "from_below"  — price was below EMA, touch is resistance test
+      "mixed"       — too many crosses, choppy — not actionable
+      "insufficient_data" — not enough bars
+
+    Also returns bars_above, bars_below counts for the notes.
+    """
+    window = prior_bars_required + max_cross_bars
+    if len(r) < window + 1 or len(es) < window + 1:
+        return "insufficient_data", 0, 0
+
+    # Look at the bars BEFORE the most recent one (the setup bars)
+    check_bars = r[-(window + 1):-1]
+    check_emas = es[-(window + 1):-1]
+
+    above_count = 0
+    below_count = 0
+    for bar, ema_val in zip(check_bars, check_emas):
+        if ema_val is None:
+            continue
+        if bar["c"] > ema_val:
+            above_count += 1
+        else:
+            below_count += 1
+
+    total = above_count + below_count
+    if total == 0:
+        return "insufficient_data", 0, 0
+
+    if above_count >= prior_bars_required and below_count <= max_cross_bars:
+        return "from_above", above_count, below_count
+    elif below_count >= prior_bars_required and above_count <= max_cross_bars:
+        return "from_below", above_count, below_count
+    else:
+        return "mixed", above_count, below_count
+
+
+# ──────────────────────────────────────────────────────────────
+# FIB HELPERS (unchanged from v3.6)
 # ──────────────────────────────────────────────────────────────
 
 def find_impulse_leg(cs, direction="long"):
-    """
-    Find the strongest qualifying impulse leg of the day.
-
-    For longs: look for the largest low→high move.
-    For shorts: look for the largest high→low move.
-
-    Qualification:
-    - Minimum FIB_MIN_BARS bars in the leg
-    - Move size >= FIB_MIN_ATR_MULT * ATR
-    - Average volume during leg > overall average (momentum confirmation)
-
-    Returns (swing_low_price, swing_high_price, leg_size, leg_bars)
-    or None if no qualifying leg found.
-    """
     r = rh(cs)
     if len(r) < FIB_MIN_BARS + 2:
         return None
-
     avg_vol = av(cs)
     atr_val = atr(cs)
     if not atr_val or not avg_vol:
         return None
-
     best = None
     best_size = 0
-
-    # Slide a window looking for the strongest impulse leg
     for start in range(len(r) - FIB_MIN_BARS):
         for end in range(start + FIB_MIN_BARS, min(start + 12, len(r))):
             leg = r[start:end + 1]
             if direction == "long":
                 leg_low  = min(c["l"] for c in leg)
                 leg_high = max(c["h"] for c in leg)
-                # Low must come before high for a bullish leg
-                low_idx  = next(i for i, c in enumerate(leg) if c["l"] == leg_low)
-                high_idx = next(i for i, c in enumerate(leg) if c["h"] == leg_high)
+                try:
+                    low_idx  = next(i for i, c in enumerate(leg) if c["l"] == leg_low)
+                    high_idx = next(i for i, c in enumerate(leg) if c["h"] == leg_high)
+                except StopIteration:
+                    continue
                 if high_idx <= low_idx:
                     continue
             else:
                 leg_high = max(c["h"] for c in leg)
                 leg_low  = min(c["l"] for c in leg)
-                high_idx = next(i for i, c in enumerate(leg) if c["h"] == leg_high)
-                low_idx  = next(i for i, c in enumerate(leg) if c["l"] == leg_low)
+                try:
+                    high_idx = next(i for i, c in enumerate(leg) if c["h"] == leg_high)
+                    low_idx  = next(i for i, c in enumerate(leg) if c["l"] == leg_low)
+                except StopIteration:
+                    continue
                 if low_idx <= high_idx:
                     continue
-
             size = leg_high - leg_low
             if size < atr_val * FIB_MIN_ATR_MULT:
                 continue
-
-            # Volume check: leg should have above-average participation
             leg_avg_vol = sum(c["v"] for c in leg) / len(leg)
             if leg_avg_vol < avg_vol * 0.8:
                 continue
-
             if size > best_size:
                 best_size = size
                 best = {
-                    "low":  leg_low,
-                    "high": leg_high,
-                    "size": size,
-                    "bars": len(leg),
-                    "start_ts": leg[0]["ts"],
-                    "end_ts":   leg[-1]["ts"],
-                    "avg_vol":  leg_avg_vol,
+                    "low": leg_low, "high": leg_high, "size": size,
+                    "bars": len(leg), "start_ts": leg[0]["ts"], "end_ts": leg[-1]["ts"],
+                    "avg_vol": leg_avg_vol,
                 }
-
     return best
 
 
 def fib_levels_from_leg(leg, direction="long"):
-    """
-    Calculate 38.2%, 50%, 61.8% retracement levels from an impulse leg.
-    For longs: retracements are measured down from the high.
-    For shorts: retracements are measured up from the low.
-    """
-    low  = leg["low"]
-    high = leg["high"]
+    low, high = leg["low"], leg["high"]
     size = high - low
     if direction == "long":
         return {
@@ -666,206 +916,6 @@ def fib_levels_from_leg(leg, direction="long"):
             0.500: round(low + size * 0.500, 2),
             0.618: round(low + size * 0.618, 2),
         }
-
-
-def fib_pullback_long(c5, p, vw, rvol):
-    """
-    Long Fib pullback setup.
-
-    After a strong bullish impulse leg, price is retracing.
-    We want to catch it at a meaningful Fib level with:
-    - Volume contracting on the pullback
-    - Price holding above the 61.8% (if it breaks 61.8% cleanly, trend may be over)
-    - RVOL confirms the name is in play
-    - EMA9 or VWAP confluence near the Fib level = bonus
-    """
-    # RVOL gate — name must be in play
-    if not rvol or rvol < RVOL_MIN:
-        return False, {}
-
-    r = rh(c5)
-    if len(r) < FIB_MIN_BARS + 4:
-        return False, {}
-
-    leg = find_impulse_leg(c5, direction="long")
-    if not leg:
-        return False, {}
-
-    levels = fib_levels_from_leg(leg, direction="long")
-    avgv   = av(c5)
-
-    # Find which Fib level price is nearest to
-    nearest_level = None
-    nearest_fib   = None
-    nearest_dist  = float("inf")
-    for fib_pct, fib_price in levels.items():
-        dist = abs(p - fib_price) / fib_price
-        if dist < nearest_dist:
-            nearest_dist  = dist
-            nearest_fib   = fib_pct
-            nearest_level = fib_price
-
-    # Must be within tolerance of a level
-    if nearest_dist > FIB_TOLERANCE:
-        return False, {}
-
-    # Price must be above the 61.8% (if below, the leg is likely done)
-    if p < levels[0.618] * 0.997:
-        return False, {}
-
-    # Must still be above VWAP — trend context
-    above_vwap = p > (vw or 0)
-    if not above_vwap:
-        return False, {}
-
-    # Pullback volume should be contracting relative to the impulse
-    pullback_bars = r[-4:]
-    pullback_vol  = sum(c["v"] for c in pullback_bars) / len(pullback_bars) if pullback_bars else 0
-    vol_contracting = pullback_vol < (avgv or float("inf")) * 0.85
-
-    # EMA9 confluence — extra confidence if EMA9 is near this Fib level
-    cls = [c["c"] for c in r]
-    es  = ema_series(cls, 9)
-    en  = es[-1]
-    ema_confluence = (en is not None and abs(en - nearest_level) / nearest_level <= FIB_CONFLUENCE)
-    vwap_confluence = (vw is not None and abs(vw - nearest_level) / nearest_level <= FIB_CONFLUENCE)
-
-    # EMA must be rising for this to be a healthy pullback
-    ema_vals = [e for e in es[-5:] if e is not None]
-    ema_rising = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
-    if not ema_rising:
-        return False, {}
-
-    # Score — 50% level is the most reliable, gets highest base
-    fib_label_map = {0.382: "38.2%", 0.500: "50%", 0.618: "61.8%"}
-    fib_label = fib_label_map.get(nearest_fib, str(nearest_fib))
-    base = {0.500: 70, 0.382: 65, 0.618: 62}.get(nearest_fib, 60)
-
-    score = base
-    score += 10 if vol_contracting else 0
-    score += 8  if rvol >= RVOL_STRONG else (4 if rvol >= RVOL_MIN else 0)
-    score += 8  if ema_confluence else 0
-    score += 6  if vwap_confluence else 0
-    score += 5  if above_vwap else 0
-    score += time_of_day_modifier()
-
-    if score < MIN_SCORE:
-        return False, {}
-
-    confluence_note = []
-    if ema_confluence:  confluence_note.append("EMA9")
-    if vwap_confluence: confluence_note.append("VWAP")
-    conf_str = " + ".join(confluence_note) if confluence_note else "None"
-
-    return True, {
-        "setup":   "FIB_PULLBACK_LONG",
-        "dir":     "🟢 LONG",
-        "trigger": f"Hold at {fib_label} retrace ${round(nearest_level, 2)} + bounce",
-        "inval":   f"Loss of 61.8% level ${round(levels[0.618], 2)}",
-        "level":   (f"Fib levels — 38.2%: ${levels[0.382]} | "
-                    f"50%: ${levels[0.500]} | 61.8%: ${levels[0.618]}"),
-        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
-        "score":   clamp_score(score),
-        "action":  "Actionable" if (vol_contracting and score >= 70) else "Watch",
-        "notes":   (f"Impulse: ${round(leg['low'], 2)}→${round(leg['high'], 2)} "
-                    f"({round(leg['size'], 2)} pts, {leg['bars']} bars) | "
-                    f"At {fib_label} | Confluence: {conf_str}"),
-        "trigger_bar_ts": r[-1]["ts"] if r else None,
-    }
-
-
-def fib_pullback_short(c5, p, vw, rvol):
-    """
-    Short Fib pullback setup.
-
-    After a strong bearish impulse leg, price is bouncing.
-    Watch the 38.2%, 50%, 61.8% bounce levels for rejection.
-    """
-    if not rvol or rvol < RVOL_MIN:
-        return False, {}
-
-    r = rh(c5)
-    if len(r) < FIB_MIN_BARS + 4:
-        return False, {}
-
-    leg = find_impulse_leg(c5, direction="short")
-    if not leg:
-        return False, {}
-
-    levels = fib_levels_from_leg(leg, direction="short")
-    avgv   = av(c5)
-
-    nearest_level = None
-    nearest_fib   = None
-    nearest_dist  = float("inf")
-    for fib_pct, fib_price in levels.items():
-        dist = abs(p - fib_price) / fib_price
-        if dist < nearest_dist:
-            nearest_dist  = dist
-            nearest_fib   = fib_pct
-            nearest_level = fib_price
-
-    if nearest_dist > FIB_TOLERANCE:
-        return False, {}
-
-    # Price must still be below 61.8% bounce level
-    if p > levels[0.618] * 1.003:
-        return False, {}
-
-    below_vwap = p < (vw or float("inf"))
-    if not below_vwap:
-        return False, {}
-
-    bounce_bars = r[-4:]
-    bounce_vol  = sum(c["v"] for c in bounce_bars) / len(bounce_bars) if bounce_bars else 0
-    vol_contracting = bounce_vol < (avgv or float("inf")) * 0.85
-
-    cls = [c["c"] for c in r]
-    es  = ema_series(cls, 9)
-    en  = es[-1]
-    ema_confluence  = (en is not None and abs(en - nearest_level) / nearest_level <= FIB_CONFLUENCE)
-    vwap_confluence = (vw is not None and abs(vw - nearest_level) / nearest_level <= FIB_CONFLUENCE)
-
-    ema_vals   = [e for e in es[-5:] if e is not None]
-    ema_falling = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
-    if not ema_falling:
-        return False, {}
-
-    fib_label_map = {0.382: "38.2%", 0.500: "50%", 0.618: "61.8%"}
-    fib_label = fib_label_map.get(nearest_fib, str(nearest_fib))
-    base = {0.500: 70, 0.382: 65, 0.618: 62}.get(nearest_fib, 60)
-
-    score = base
-    score += 10 if vol_contracting else 0
-    score += 8  if rvol >= RVOL_STRONG else (4 if rvol >= RVOL_MIN else 0)
-    score += 8  if ema_confluence else 0
-    score += 6  if vwap_confluence else 0
-    score += 5  if below_vwap else 0
-    score += time_of_day_modifier()
-
-    if score < MIN_SCORE:
-        return False, {}
-
-    confluence_note = []
-    if ema_confluence:  confluence_note.append("EMA9")
-    if vwap_confluence: confluence_note.append("VWAP")
-    conf_str = " + ".join(confluence_note) if confluence_note else "None"
-
-    return True, {
-        "setup":   "FIB_PULLBACK_SHORT",
-        "dir":     "🔴 SHORT",
-        "trigger": f"Rejection at {fib_label} bounce ${round(nearest_level, 2)}",
-        "inval":   f"Acceptance above 61.8% bounce ${round(levels[0.618], 2)}",
-        "level":   (f"Fib levels — 38.2%: ${levels[0.382]} | "
-                    f"50%: ${levels[0.500]} | 61.8%: ${levels[0.618]}"),
-        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
-        "score":   clamp_score(score),
-        "action":  "Actionable" if (vol_contracting and score >= 70) else "Watch",
-        "notes":   (f"Impulse: ${round(leg['high'], 2)}→${round(leg['low'], 2)} "
-                    f"({round(leg['size'], 2)} pts, {leg['bars']} bars) | "
-                    f"At {fib_label} | Confluence: {conf_str}"),
-        "trigger_bar_ts": r[-1]["ts"] if r else None,
-    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -895,11 +945,11 @@ def micro_base_stats(cs, lookback=5, exclude_last=1):
     base = r[-need:-exclude_last] if exclude_last > 0 else r[-lookback:]
     if len(base) < 3:
         return None
-    base_high  = max(c["h"] for c in base)
-    base_low   = min(c["l"] for c in base)
-    avg_close  = sum(c["c"] for c in base) / len(base)
-    width      = base_high - base_low
-    tight_pct  = (width / avg_close) if avg_close else 999
+    base_high = max(c["h"] for c in base)
+    base_low  = min(c["l"] for c in base)
+    avg_close = sum(c["c"] for c in base) / len(base)
+    width     = base_high - base_low
+    tight_pct = (width / avg_close) if avg_close else 999
     return {"bars": base, "high": base_high, "low": base_low,
             "width": width, "tight_pct": tight_pct}
 
@@ -909,26 +959,45 @@ def micro_base_stats(cs, lookback=5, exclude_last=1):
 # ──────────────────────────────────────────────────────────────
 
 def _trigger_bar(r):
+    """Safe trigger bar — never returns None if r is non-empty."""
     return r[-1]["ts"] if r else None
 
 
-def _apply_quality_modifiers(score, rvol, rs_mod, direction="long"):
+def _apply_quality_modifiers(score, rvol, rs_mod, rs_tier="?"):
     """
-    Apply RVOL and RS modifiers to any setup's score.
-    Called at the end of each existing setup function.
+    Apply RVOL, RS, and time-of-day modifiers.
+
+    rs_tier from grade_rs() further gates the score:
+    - "A+" counter-trend RS: score gets full +15 from rs_mod
+    - "A"  strong RS:        score gets full modifier
+    - "B"  neutral:          no extra gate, modifier applied normally
+    - "C"  weak:             additional -5 penalty on top of rs_mod
+    - "D"  lagging:          additional -8 penalty — marginal setups die here
+    - "?"  unknown:          no penalty, just apply rs_mod
+    This means a "D" score setup (stock lagging badly) needs to have
+    very strong core conditions to survive the combined penalty.
+    A "C" setup that otherwise scores 65 will land at ~52 after penalties
+    and won't fire. An "A+" counter-trend setup scoring 65 will land at
+    ~80+ and fires as a high-confidence alert.
     """
     # RVOL modifier
     if rvol is None:
-        score -= 5   # can't confirm volume — slight penalty
+        score -= 5
     elif rvol >= RVOL_STRONG:
         score += 8
     elif rvol >= RVOL_MIN:
         score += 3
     else:
-        score -= 10  # below minimum RVOL — weak name
+        score -= 10
 
-    # RS modifier (already computed externally)
+    # RS modifier — already includes tier-appropriate value from grade_rs()
     score += rs_mod
+
+    # Additional tier penalty for weak RS (stacks on top of rs_mod)
+    if rs_tier == "D":
+        score -= 8
+    elif rs_tier == "C":
+        score -= 5
 
     # Time of day
     score += time_of_day_modifier()
@@ -937,10 +1006,10 @@ def _apply_quality_modifiers(score, rvol, rs_mod, direction="long"):
 
 
 # ──────────────────────────────────────────────────────────────
-# CORE SETUPS — same logic as v3.5, now accept rvol + rs_mod
+# CORE SETUPS
 # ──────────────────────────────────────────────────────────────
 
-def orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
+def orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod, rs_tier="?"):
     ts = now_et()
     if not hhmm_lte(ts, *ORB_5M_CUTOFF):
         return False, {}
@@ -951,10 +1020,10 @@ def orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
     if len(r) < 2:
         return False, {}
     last, prev = r[-1], r[-2]
-    avgv = av(c5)
+    _, recent_vol, vol_ratio = vol_baseline(c5)
     broke      = p > oh
     above_vwap = p > (vw or 0)
-    vol        = last["v"] > (avgv or 0) * 1.3
+    vol        = vol_ratio is not None and vol_ratio >= 1.3
     was_below  = prev["c"] <= oh
     if not (broke and above_vwap and was_below):
         return False, {}
@@ -977,7 +1046,7 @@ def orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
     }
 
 
-def orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
+def orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod, rs_tier="?"):
     ts = now_et()
     if not hhmm_gte(ts, *ORB_15M_START) or not hhmm_lte(ts, *ORB_15M_CUTOFF):
         return False, {}
@@ -988,10 +1057,10 @@ def orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
     if len(r) < 2:
         return False, {}
     last, prev = r[-1], r[-2]
-    avgv = av(c5)
+    _, recent_vol, vol_ratio = vol_baseline(c5)
     broke      = p > oh
     above_vwap = p > (vw or 0)
-    vol        = last["v"] > (avgv or 0) * 1.2
+    vol        = vol_ratio is not None and vol_ratio >= 1.2
     was_below  = prev["c"] <= oh
     if not (broke and above_vwap and was_below):
         return False, {}
@@ -1013,7 +1082,7 @@ def orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod):
     }
 
 
-def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod):
+def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod, rs_tier="?"):
     if not pmh_v:
         return False, {}
     r = rh(c5)
@@ -1022,11 +1091,11 @@ def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod):
     broke = any(c["h"] > pmh_v for c in r[:-2])
     if not broke:
         return False, {}
-    near         = abs(p - pmh_v) / pmh_v <= 0.004
-    above        = p >= pmh_v * 0.998
-    above_vwap   = p > (vw or 0)
-    avgv         = av(c5)
-    light_pb     = all(c["v"] < (avgv or float("inf")) * 0.9 for c in r[-2:])
+    near       = abs(p - pmh_v) / pmh_v <= 0.004
+    above      = p >= pmh_v * 0.998
+    above_vwap = p > (vw or 0)
+    _, _, vol_ratio = vol_baseline(c5)
+    light_pb   = vol_ratio is not None and vol_ratio <= 0.85
     if not (above and above_vwap):
         return False, {}
     score = _apply_quality_modifiers(
@@ -1048,7 +1117,7 @@ def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod):
     }
 
 
-def pml_retest(c5, p, vw, pml_v, rvol, rs_mod):
+def pml_retest(c5, p, vw, pml_v, rvol, rs_mod, rs_tier="?"):
     if not pml_v:
         return False, {}
     r = rh(c5)
@@ -1060,13 +1129,13 @@ def pml_retest(c5, p, vw, pml_v, rvol, rs_mod):
     near         = abs(p - pml_v) / pml_v <= 0.004
     below        = p <= pml_v * 1.002
     below_vwap   = p < (vw or float("inf"))
-    avgv         = av(c5)
-    light_bounce = all(c["v"] < (avgv or float("inf")) * 0.9 for c in r[-2:])
+    _, _, vol_ratio = vol_baseline(c5)
+    light_bounce = vol_ratio is not None and vol_ratio <= 0.85
     if not (below and below_vwap):
         return False, {}
     score = _apply_quality_modifiers(
         65 + (10 if near else 0) + (10 if light_bounce else 0),
-        rvol, -rs_mod  # invert RS for shorts — lagging = good
+        rvol, -rs_mod
     )
     if score < MIN_SCORE:
         return False, {}
@@ -1083,14 +1152,13 @@ def pml_retest(c5, p, vw, pml_v, rvol, rs_mod):
     }
 
 
-def vwap_reclaim(c5, p, vw, rvol, rs_mod):
+def vwap_reclaim(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if not vw:
         return False, {}
     r = rh(c5)
     if len(r) < 4:
         return False, {}
     last, prev = r[-1], r[-2]
-    avgv       = av(c5)
     was_below  = any(c["c"] < vw for c in r[-5:-1])
     if not was_below:
         return False, {}
@@ -1098,7 +1166,8 @@ def vwap_reclaim(c5, p, vw, rvol, rs_mod):
     first  = strong and prev["c"] < vw
     if not strong:
         return False, {}
-    vol = last["v"] > (avgv or 0) * 1.2
+    _, _, vol_ratio = vol_baseline(c5)
+    vol = vol_ratio is not None and vol_ratio >= 1.2
     prior_slice = r[-8:-2]
     prior_fails = sum(1 for i in range(1, len(prior_slice))
                      if prior_slice[i]["c"] > vw and prior_slice[i - 1]["c"] < vw)
@@ -1121,7 +1190,7 @@ def vwap_reclaim(c5, p, vw, rvol, rs_mod):
     }
 
 
-def vwap_reject(c5, p, vw, rvol, rs_mod):
+def vwap_reject(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if not vw:
         return False, {}
     r = rh(c5)
@@ -1134,8 +1203,8 @@ def vwap_reject(c5, p, vw, rvol, rs_mod):
     was_below = any(c["c"] < vw for c in r[-6:-3])
     if not (near and below and bear and was_below):
         return False, {}
-    avgv = av(c5)
-    vol  = last["v"] > (avgv or 0) * 1.1
+    _, _, vol_ratio = vol_baseline(c5)
+    vol = vol_ratio is not None and vol_ratio >= 1.1
     score = _apply_quality_modifiers(
         65 + (10 if vol else 0) + (10 if bear else 0),
         rvol, -rs_mod
@@ -1154,25 +1223,38 @@ def vwap_reject(c5, p, vw, rvol, rs_mod):
     }
 
 
-def ema9_pb_long(c5, p, vw, rvol, rs_mod):
+def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
+    """
+    9 EMA pullback long — 5-minute bars.
+    Price must have been ABOVE the EMA for prior bars before touching.
+    Filters out resistance tests from below.
+    """
     r = rh(c5)
-    if len(r) < 12:
+    if len(r) < 14:
         return False, {}
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
     en  = es[-1]
     if en is None:
         return False, {}
-    ema_vals = [e for e in es[-5:] if e is not None]
-    rising   = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
+
+    # Direction context — CRITICAL FIX
+    ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
+    if ctx != "from_above":
+        return False, {}    # price was below EMA — this is a resistance test, not a pullback
+
+    ema_vals   = [e for e in es[-5:] if e is not None]
+    rising     = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
     last, prev = r[-1], r[-2]
-    above_vwap   = p > (vw or 0)
-    touched      = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
-    bouncing     = last["c"] > prev["h"] or last["c"] > en
-    avgv         = av(c5)
-    light_pb     = last["v"] < (avgv or float("inf")) * 0.85
+    above_vwap = p > (vw or 0)
+    touched    = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
+    bouncing   = last["c"] > prev["h"] or last["c"] > en
+    _, _, vol_ratio = vol_baseline(c5)
+    light_pb   = vol_ratio is not None and vol_ratio <= 0.80
+
     if not (rising and above_vwap and touched and bouncing):
         return False, {}
+
     score = _apply_quality_modifiers(
         65 + (10 if light_pb else 0) + (10 if above_vwap else 0) + (5 if rising else 0),
         rvol, rs_mod
@@ -1181,35 +1263,48 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod):
         return False, {}
     return True, {
         "setup": "EMA9_5M_PULLBACK_LONG", "dir": "🟢 LONG",
-        "trigger": "Bounce after 9 EMA touch",
+        "trigger": "Bounce after 9 EMA touch (from above)",
         "inval":   f"Loss of 9 EMA ${round(en, 2)}",
         "level":   f"9 EMA: ${round(en, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
         "vol":     f"Pullback light ✅ RVOL {rvol}x" if light_pb else f"Watch RVOL {rvol}x",
         "score":   score, "action": "Actionable",
-        "notes":   "Rising EMA + controlled pullback",
+        "notes":   f"Rising EMA | {bars_above}b above / {bars_below}b below before touch",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
 
-def ema9_pb_short(c5, p, vw, rvol, rs_mod):
+def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
+    """
+    9 EMA pullback short — 5-minute bars.
+    Price must have been BELOW the EMA for prior bars before bouncing.
+    Filters out support tests from above.
+    """
     r = rh(c5)
-    if len(r) < 12:
+    if len(r) < 14:
         return False, {}
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
     en  = es[-1]
     if en is None:
         return False, {}
+
+    # Direction context
+    ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
+    if ctx != "from_below":
+        return False, {}    # price was above EMA — this is a support test, not a short setup
+
     ema_vals  = [e for e in es[-5:] if e is not None]
     falling   = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
     last, prev = r[-1], r[-2]
-    below_vwap  = p < (vw or float("inf"))
-    touched     = last["h"] >= en * 0.997 or prev["h"] >= en * 0.997
-    rejecting   = last["c"] < last["o"] and last["c"] < en
-    avgv        = av(c5)
-    light_bounce = last["v"] < (avgv or float("inf")) * 0.85
+    below_vwap = p < (vw or float("inf"))
+    touched    = last["h"] >= en * 0.997 or prev["h"] >= en * 0.997
+    rejecting  = last["c"] < last["o"] and last["c"] < en
+    _, _, vol_ratio = vol_baseline(c5)
+    light_bounce = vol_ratio is not None and vol_ratio <= 0.80
+
     if not (falling and below_vwap and touched and rejecting):
         return False, {}
+
     score = _apply_quality_modifiers(
         65 + (10 if light_bounce else 0) + (10 if below_vwap else 0) + (5 if falling else 0),
         rvol, -rs_mod
@@ -1218,24 +1313,278 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod):
         return False, {}
     return True, {
         "setup": "EMA9_5M_PULLBACK_SHORT", "dir": "🔴 SHORT",
-        "trigger": f"Break below ${round(prev['l'], 2)} after EMA rejection",
+        "trigger": f"Break below ${round(prev['l'], 2)} after EMA rejection (from below)",
         "inval":   f"Reclaim through 9 EMA ${round(en, 2)}",
         "level":   f"9 EMA resistance: ${round(en, 2)}",
         "vol":     f"Bounce light ✅ RVOL {rvol}x" if light_bounce else f"Watch RVOL {rvol}x",
         "score":   score, "action": "Actionable",
-        "notes":   "Falling EMA, weak bounce, rejecting",
+        "notes":   f"Falling EMA | {bars_below}b below / {bars_above}b above before bounce",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
 
-def flag_long(c5, p, vw, rvol, rs_mod):
+def ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
+    """
+    9 EMA pullback long — 10-minute bars.
+    Higher timeframe = higher quality confirmation, higher base score.
+    Requires 5 bars above EMA before touch (stricter than 5-min).
+    """
+    r = rh(c10)
+    if len(r) < 12:
+        return False, {}
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    if en is None:
+        return False, {}
+
+    ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_10M)
+    if ctx != "from_above":
+        return False, {}
+
+    ema_vals   = [e for e in es[-4:] if e is not None]
+    rising     = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
+    last, prev = r[-1], r[-2]
+    above_vwap = p > (vw or 0)
+    touched    = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
+    bouncing   = last["c"] > prev["h"] or last["c"] > en
+    _, _, vol_ratio = vol_baseline(c10)
+    light_pb   = vol_ratio is not None and vol_ratio <= 0.80
+
+    if not (rising and above_vwap and touched and bouncing):
+        return False, {}
+
+    # 10-min base score is higher — more bars = more confirmation
+    score = _apply_quality_modifiers(
+        70 + (10 if light_pb else 0) + (10 if above_vwap else 0) + (5 if rising else 0),
+        rvol, rs_mod
+    )
+    if score < MIN_SCORE:
+        return False, {}
+    return True, {
+        "setup": "EMA9_10M_PULLBACK_LONG", "dir": "🟢 LONG",
+        "trigger": "Bounce after 9 EMA touch on 10-min (from above)",
+        "inval":   f"Loss of 10-min 9 EMA ${round(en, 2)}",
+        "level":   f"10m 9 EMA: ${round(en, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
+        "vol":     f"Pullback light ✅ RVOL {rvol}x" if light_pb else f"Watch RVOL {rvol}x",
+        "score":   score, "action": "Actionable",
+        "notes":   f"10-min confirmation | {bars_above}b above / {bars_below}b below before touch",
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def ema9_pb_short_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
+    """9 EMA pullback short on 10-minute bars."""
+    r = rh(c10)
+    if len(r) < 12:
+        return False, {}
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    if en is None:
+        return False, {}
+
+    ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_10M)
+    if ctx != "from_below":
+        return False, {}
+
+    ema_vals  = [e for e in es[-4:] if e is not None]
+    falling   = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
+    last, prev = r[-1], r[-2]
+    below_vwap = p < (vw or float("inf"))
+    touched    = last["h"] >= en * 0.997 or prev["h"] >= en * 0.997
+    rejecting  = last["c"] < last["o"] and last["c"] < en
+    _, _, vol_ratio = vol_baseline(c10)
+    light_bounce = vol_ratio is not None and vol_ratio <= 0.80
+
+    if not (falling and below_vwap and touched and rejecting):
+        return False, {}
+
+    score = _apply_quality_modifiers(
+        70 + (10 if light_bounce else 0) + (10 if below_vwap else 0) + (5 if falling else 0),
+        rvol, -rs_mod
+    )
+    if score < MIN_SCORE:
+        return False, {}
+    return True, {
+        "setup": "EMA9_10M_PULLBACK_SHORT", "dir": "🔴 SHORT",
+        "trigger": f"Break below ${round(prev['l'], 2)} after 10-min EMA rejection",
+        "inval":   f"Reclaim through 10-min 9 EMA ${round(en, 2)}",
+        "level":   f"10m 9 EMA resistance: ${round(en, 2)}",
+        "vol":     f"Bounce light ✅ RVOL {rvol}x" if light_bounce else f"Watch RVOL {rvol}x",
+        "score":   score, "action": "Actionable",
+        "notes":   f"10-min confirmation | {bars_below}b below / {bars_above}b above before bounce",
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def ema4_10m_rider_long(c10, p, vw, rvol, rs_mod, rs_tier="?"):
+    """
+    4 EMA rider on 10-minute chart — catches runners.
+
+    A stock in a strong directional trend rides the 4 EMA on 10-min.
+    When price pulls back gently to touch the 4 EMA with contracting
+    volume, it's the add zone or continuation entry for a runner.
+
+    Requirements:
+    - 4 EMA on 10-min is clearly upsloped (quantified by slope threshold)
+    - Price has been ABOVE the 4 EMA for at least EMA4_MIN_BARS bars
+    - Price touches or comes within EMA4_TOUCH_PCT of the 4 EMA
+    - Volume contracting on pullback bars (healthy retracement)
+    - RVOL > 1.5x — name must be active
+    - Price above VWAP — trend context
+
+    This setup intentionally does NOT fire on rangebound names because
+    the slope requirement eliminates flat/chop conditions.
+    """
+    r = rh(c10)
+    if len(r) < EMA4_MIN_BARS + 4:
+        return False, {}
+
+    cls = [c["c"] for c in r]
+    es4 = ema_series(cls, 4)
+    en4 = es4[-1]
+    if en4 is None:
+        return False, {}
+
+    # Slope check — is the 4 EMA actually trending up?
+    ema4_vals = [e for e in es4[-(EMA4_MIN_BARS + 2):] if e is not None]
+    if len(ema4_vals) < 3:
+        return False, {}
+    avg_price = cls[-1] if cls[-1] else 1
+    # Slope = (end - start) / (n bars * price) — normalized per bar per dollar
+    slope = (ema4_vals[-1] - ema4_vals[0]) / (len(ema4_vals) * avg_price)
+    if slope < EMA4_SLOPE_MIN:
+        return False, {}    # 4 EMA is flat or declining — not a runner condition
+
+    # Count bars above 4 EMA in the recent window
+    recent_r   = r[-(EMA4_MIN_BARS + 3):]
+    recent_es4 = es4[-(EMA4_MIN_BARS + 3):]
+    bars_above = sum(1 for bar, ev in zip(recent_r, recent_es4)
+                     if ev is not None and bar["c"] > ev)
+    if bars_above < EMA4_MIN_BARS:
+        return False, {}    # hasn't been trending long enough
+
+    # Price touching the 4 EMA now (or previous bar)
+    last, prev = r[-1], r[-2]
+    touching = (abs(last["l"] - en4) / en4 <= EMA4_TOUCH_PCT or
+                abs(prev["l"] - en4) / en4 <= EMA4_TOUCH_PCT or
+                last["l"] <= en4 * (1 + EMA4_TOUCH_PCT))
+    if not touching:
+        return False, {}
+
+    # Must still be holding above VWAP
+    above_vwap = p > (vw or 0)
+    if not above_vwap:
+        return False, {}
+
+    # Volume contracting on pullback (last 2 bars)
+    _, _, vol_ratio = vol_baseline(c10)
+    vol_contracting = vol_ratio is not None and vol_ratio <= 0.80
+
+    # RVOL gate — must be in play
+    if not rvol or rvol < RVOL_MIN:
+        return False, {}
+
+    score = _apply_quality_modifiers(
+        68 + (12 if vol_contracting else 0) + (8 if above_vwap else 0)
+           + (5 if rvol >= RVOL_STRONG else 0),
+        rvol, rs_mod
+    )
+    if score < MIN_SCORE:
+        return False, {}
+
+    slope_pct = round(slope * 100, 3)
+    return True, {
+        "setup": "EMA4_10M_RIDER_LONG", "dir": "🟢 LONG",
+        "trigger": f"Pullback to 10-min 4 EMA ${round(en4, 2)} — runner add zone",
+        "inval":   f"Loss of 4 EMA ${round(en4, 2)} + close below",
+        "level":   f"10m 4 EMA: ${round(en4, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
+        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
+        "score":   score,
+        "action":  "Actionable" if vol_contracting else "Watch",
+        "notes":   (f"Riding 4 EMA on 10-min | Slope: +{slope_pct}%/bar | "
+                    f"{bars_above} bars trending above | Add or continuation entry"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def ema4_10m_rider_short(c10, p, vw, rvol, rs_mod, rs_tier="?"):
+    """4 EMA rider on 10-minute chart — short side."""
+    r = rh(c10)
+    if len(r) < EMA4_MIN_BARS + 4:
+        return False, {}
+
+    cls = [c["c"] for c in r]
+    es4 = ema_series(cls, 4)
+    en4 = es4[-1]
+    if en4 is None:
+        return False, {}
+
+    ema4_vals = [e for e in es4[-(EMA4_MIN_BARS + 2):] if e is not None]
+    if len(ema4_vals) < 3:
+        return False, {}
+    avg_price = cls[-1] if cls[-1] else 1
+    slope = (ema4_vals[-1] - ema4_vals[0]) / (len(ema4_vals) * avg_price)
+    if slope > -EMA4_SLOPE_MIN:
+        return False, {}    # not sloping down
+
+    recent_r   = r[-(EMA4_MIN_BARS + 3):]
+    recent_es4 = es4[-(EMA4_MIN_BARS + 3):]
+    bars_below = sum(1 for bar, ev in zip(recent_r, recent_es4)
+                     if ev is not None and bar["c"] < ev)
+    if bars_below < EMA4_MIN_BARS:
+        return False, {}
+
+    last, prev = r[-1], r[-2]
+    touching = (abs(last["h"] - en4) / en4 <= EMA4_TOUCH_PCT or
+                abs(prev["h"] - en4) / en4 <= EMA4_TOUCH_PCT or
+                last["h"] >= en4 * (1 - EMA4_TOUCH_PCT))
+    if not touching:
+        return False, {}
+
+    below_vwap = p < (vw or float("inf"))
+    if not below_vwap:
+        return False, {}
+
+    _, _, vol_ratio = vol_baseline(c10)
+    vol_contracting = vol_ratio is not None and vol_ratio <= 0.80
+
+    if not rvol or rvol < RVOL_MIN:
+        return False, {}
+
+    score = _apply_quality_modifiers(
+        68 + (12 if vol_contracting else 0) + (8 if below_vwap else 0)
+           + (5 if rvol >= RVOL_STRONG else 0),
+        rvol, -rs_mod
+    )
+    if score < MIN_SCORE:
+        return False, {}
+
+    slope_pct = round(abs(slope) * 100, 3)
+    return True, {
+        "setup": "EMA4_10M_RIDER_SHORT", "dir": "🔴 SHORT",
+        "trigger": f"Bounce to 10-min 4 EMA ${round(en4, 2)} — runner add zone short",
+        "inval":   f"Reclaim above 4 EMA ${round(en4, 2)} + close above",
+        "level":   f"10m 4 EMA: ${round(en4, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
+        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
+        "score":   score,
+        "action":  "Actionable" if vol_contracting else "Watch",
+        "notes":   (f"Riding 4 EMA on 10-min (short) | Slope: -{slope_pct}%/bar | "
+                    f"{bars_below} bars trending below | Add or continuation entry"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def flag_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     r = rh(c5)
     if len(r) < 8:
         return False, {}
-    avgv    = av(c5)
+    _, _, vol_ratio = vol_baseline(c5)
+    avg_vol = av(c5)
     impulse = None
     for c in r[-10:-3]:
-        if (c["c"] - c["o"]) > 0 and c["v"] > (avgv or 0) * 1.5:
+        if (c["c"] - c["o"]) > 0 and c["v"] > (avg_vol or 0) * 1.5:
             impulse = c
             break
     if not impulse:
@@ -1249,12 +1598,12 @@ def flag_long(c5, p, vw, rvol, rs_mod):
     above_vwap = p > (vw or 0)
     last       = r[-1]
     broke      = last["c"] > flag_high and last["c"] > r[-2]["h"]
-    vol        = last["v"] > (avgv or 0) * 1.2
-    dried_up   = all(c["v"] < (avgv or float("inf")) * 0.8 for c in cons[:-1])
+    vol_expand = vol_ratio is not None and vol_ratio >= 1.2
+    dried_up   = vol_ratio is not None and vol_ratio <= 0.80
     if not (tight and broke and above_vwap):
         return False, {}
     score = _apply_quality_modifiers(
-        65 + (10 if dried_up else 0) + (15 if vol else 0) + (5 if tight else 0),
+        65 + (10 if dried_up else 0) + (15 if vol_expand else 0) + (5 if tight else 0),
         rvol, rs_mod
     )
     if score < MIN_SCORE:
@@ -1264,15 +1613,15 @@ def flag_long(c5, p, vw, rvol, rs_mod):
         "trigger": f"Break above flag high ${round(flag_high, 2)}",
         "inval":   f"Loss of flag low ${round(flag_low, 2)}",
         "level":   f"Flag: ${round(flag_low, 2)}–${round(flag_high, 2)}",
-        "vol":     f"Dry-up + expansion ✅ RVOL {rvol}x" if (dried_up and vol) else f"Watch RVOL {rvol}x",
+        "vol":     f"Dry-up + expansion ✅ RVOL {rvol}x" if (dried_up and vol_expand) else f"Watch RVOL {rvol}x",
         "score":   score,
-        "action":  "Actionable" if (vol and tight) else "Watch",
+        "action":  "Actionable" if (vol_expand and tight) else "Watch",
         "notes":   f"Flag range ${round(flag_range, 2)} vs impulse ${round(imp_size, 2)}",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
 
-def pdh_retest(c5, p, vw, pdh, rvol, rs_mod):
+def pdh_retest(c5, p, vw, pdh, rvol, rs_mod, rs_tier="?"):
     if not pdh:
         return False, {}
     r = rh(c5)
@@ -1283,8 +1632,8 @@ def pdh_retest(c5, p, vw, pdh, rvol, rs_mod):
     near       = abs(p - pdh) / pdh <= 0.005
     above      = p >= pdh * 0.998
     above_vwap = p > (vw or 0)
-    avgv       = av(c5)
-    light_pb   = all(c["v"] < (avgv or float("inf")) * 0.9 for c in r[-2:])
+    _, _, vol_ratio = vol_baseline(c5)
+    light_pb   = vol_ratio is not None and vol_ratio <= 0.85
     if not (above and above_vwap):
         return False, {}
     score = _apply_quality_modifiers(
@@ -1306,7 +1655,7 @@ def pdh_retest(c5, p, vw, pdh, rvol, rs_mod):
     }
 
 
-def pdl_retest(c5, p, vw, pdl, rvol, rs_mod):
+def pdl_retest(c5, p, vw, pdl, rvol, rs_mod, rs_tier="?"):
     if not pdl:
         return False, {}
     r = rh(c5)
@@ -1317,8 +1666,8 @@ def pdl_retest(c5, p, vw, pdl, rvol, rs_mod):
     near         = abs(p - pdl) / pdl <= 0.005
     below        = p <= pdl * 1.002
     below_vwap   = p < (vw or float("inf"))
-    avgv         = av(c5)
-    light_bounce = all(c["v"] < (avgv or float("inf")) * 0.9 for c in r[-2:])
+    _, _, vol_ratio = vol_baseline(c5)
+    light_bounce = vol_ratio is not None and vol_ratio <= 0.85
     if not (below and below_vwap):
         return False, {}
     score = _apply_quality_modifiers(
@@ -1340,7 +1689,7 @@ def pdl_retest(c5, p, vw, pdl, rvol, rs_mod):
     }
 
 
-def later_day_hod_breakout(c5, p, vw, rvol, rs_mod):
+def later_day_hod_breakout(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     ts = now_et()
     if not in_window(ts, HOD_START[0], HOD_START[1], HOD_END[0], HOD_END[1]):
         return False, {}
@@ -1351,11 +1700,11 @@ def later_day_hod_breakout(c5, p, vw, rvol, rs_mod):
     prior_hod  = max(c["h"] for c in r[:-1]) if len(r) > 1 else None
     if prior_hod is None:
         return False, {}
-    above_vwap   = p > (vw or 0)
-    broke        = p > prior_hod and prev["c"] <= prior_hod
-    avgv         = av(c5)
-    vol          = last["v"] > (avgv or 0) * 1.2
-    base_below   = len(r) >= 5 and all(c["h"] <= prior_hod * 1.002 for c in r[-5:-1])
+    above_vwap = p > (vw or 0)
+    broke      = p > prior_hod and prev["c"] <= prior_hod
+    _, _, vol_ratio = vol_baseline(c5)
+    vol        = vol_ratio is not None and vol_ratio >= 1.2
+    base_below = len(r) >= 5 and all(c["h"] <= prior_hod * 1.002 for c in r[-5:-1])
     if not (broke and above_vwap):
         return False, {}
     score = _apply_quality_modifiers(
@@ -1376,9 +1725,126 @@ def later_day_hod_breakout(c5, p, vw, rvol, rs_mod):
     }
 
 
+def fib_pullback_long(c5, p, vw, rvol):
+    if not rvol or rvol < RVOL_MIN:
+        return False, {}
+    r = rh(c5)
+    if len(r) < FIB_MIN_BARS + 4:
+        return False, {}
+    leg = find_impulse_leg(c5, direction="long")
+    if not leg:
+        return False, {}
+    levels = fib_levels_from_leg(leg, direction="long")
+    nearest_level, nearest_fib, nearest_dist = None, None, float("inf")
+    for fib_pct, fib_price in levels.items():
+        dist = abs(p - fib_price) / fib_price
+        if dist < nearest_dist:
+            nearest_dist, nearest_fib, nearest_level = dist, fib_pct, fib_price
+    if nearest_dist > FIB_TOLERANCE:
+        return False, {}
+    if p < levels[0.618] * 0.997:
+        return False, {}
+    above_vwap = p > (vw or 0)
+    if not above_vwap:
+        return False, {}
+    _, _, vol_ratio = vol_baseline(c5)
+    vol_contracting = vol_ratio is not None and vol_ratio <= 0.85
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    ema_confluence  = (en is not None and abs(en - nearest_level) / nearest_level <= FIB_CONFLUENCE)
+    vwap_confluence = (vw is not None and abs(vw - nearest_level) / nearest_level <= FIB_CONFLUENCE)
+    ema_vals   = [e for e in es[-5:] if e is not None]
+    ema_rising = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
+    if not ema_rising:
+        return False, {}
+    fib_label = {0.382: "38.2%", 0.500: "50%", 0.618: "61.8%"}.get(nearest_fib, str(nearest_fib))
+    base  = {0.500: 70, 0.382: 65, 0.618: 62}.get(nearest_fib, 60)
+    score = base
+    score += 10 if vol_contracting else 0
+    score += 8  if rvol >= RVOL_STRONG else (4 if rvol >= RVOL_MIN else 0)
+    score += 8  if ema_confluence else 0
+    score += 6  if vwap_confluence else 0
+    score += 5  if above_vwap else 0
+    score += time_of_day_modifier()
+    if score < MIN_SCORE:
+        return False, {}
+    conf_str = " + ".join(filter(None, ["EMA9" if ema_confluence else "", "VWAP" if vwap_confluence else ""])) or "None"
+    return True, {
+        "setup":   "FIB_PULLBACK_LONG", "dir": "🟢 LONG",
+        "trigger": f"Hold at {fib_label} retrace ${round(nearest_level, 2)} + bounce",
+        "inval":   f"Loss of 61.8% level ${round(levels[0.618], 2)}",
+        "level":   f"38.2%:${levels[0.382]} | 50%:${levels[0.500]} | 61.8%:${levels[0.618]}",
+        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
+        "score":   clamp_score(score),
+        "action":  "Actionable" if (vol_contracting and score >= 70) else "Watch",
+        "notes":   (f"Impulse ${round(leg['low'],2)}→${round(leg['high'],2)} "
+                    f"({round(leg['size'],2)}pts {leg['bars']}bars) | At {fib_label} | Conf: {conf_str}"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def fib_pullback_short(c5, p, vw, rvol):
+    if not rvol or rvol < RVOL_MIN:
+        return False, {}
+    r = rh(c5)
+    if len(r) < FIB_MIN_BARS + 4:
+        return False, {}
+    leg = find_impulse_leg(c5, direction="short")
+    if not leg:
+        return False, {}
+    levels = fib_levels_from_leg(leg, direction="short")
+    nearest_level, nearest_fib, nearest_dist = None, None, float("inf")
+    for fib_pct, fib_price in levels.items():
+        dist = abs(p - fib_price) / fib_price
+        if dist < nearest_dist:
+            nearest_dist, nearest_fib, nearest_level = dist, fib_pct, fib_price
+    if nearest_dist > FIB_TOLERANCE:
+        return False, {}
+    if p > levels[0.618] * 1.003:
+        return False, {}
+    below_vwap = p < (vw or float("inf"))
+    if not below_vwap:
+        return False, {}
+    _, _, vol_ratio = vol_baseline(c5)
+    vol_contracting = vol_ratio is not None and vol_ratio <= 0.85
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    ema_confluence  = (en is not None and abs(en - nearest_level) / nearest_level <= FIB_CONFLUENCE)
+    vwap_confluence = (vw is not None and abs(vw - nearest_level) / nearest_level <= FIB_CONFLUENCE)
+    ema_vals   = [e for e in es[-5:] if e is not None]
+    ema_falling = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
+    if not ema_falling:
+        return False, {}
+    fib_label = {0.382: "38.2%", 0.500: "50%", 0.618: "61.8%"}.get(nearest_fib, str(nearest_fib))
+    base  = {0.500: 70, 0.382: 65, 0.618: 62}.get(nearest_fib, 60)
+    score = base
+    score += 10 if vol_contracting else 0
+    score += 8  if rvol >= RVOL_STRONG else (4 if rvol >= RVOL_MIN else 0)
+    score += 8  if ema_confluence else 0
+    score += 6  if vwap_confluence else 0
+    score += 5  if below_vwap else 0
+    score += time_of_day_modifier()
+    if score < MIN_SCORE:
+        return False, {}
+    conf_str = " + ".join(filter(None, ["EMA9" if ema_confluence else "", "VWAP" if vwap_confluence else ""])) or "None"
+    return True, {
+        "setup":   "FIB_PULLBACK_SHORT", "dir": "🔴 SHORT",
+        "trigger": f"Rejection at {fib_label} bounce ${round(nearest_level, 2)}",
+        "inval":   f"Acceptance above 61.8% bounce ${round(levels[0.618], 2)}",
+        "level":   f"38.2%:${levels[0.382]} | 50%:${levels[0.500]} | 61.8%:${levels[0.618]}",
+        "vol":     f"Contracting ✅ RVOL {rvol}x" if vol_contracting else f"Watch | RVOL {rvol}x",
+        "score":   clamp_score(score),
+        "action":  "Actionable" if (vol_contracting and score >= 70) else "Watch",
+        "notes":   (f"Impulse ${round(leg['high'],2)}→${round(leg['low'],2)} "
+                    f"({round(leg['size'],2)}pts {leg['bars']}bars) | At {fib_label} | Conf: {conf_str}"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
 # ──────────────────────────────────────────────────────────────
-# SWEEP LOGIC (unchanged — sweeps don't need RVOL/RS as they
-# are armed manually only on in-play names)
+# SWEEP LOGIC (unchanged — armed names only)
 # ──────────────────────────────────────────────────────────────
 
 def sweep_watch_long_v2(c2, p, vw):
@@ -1408,8 +1874,7 @@ def sweep_watch_long_v2(c2, p, vw):
         "trigger": f"Pressing micro-base low ${round(base['low'], 2)}",
         "inval":   f"Clean loss of ${round(base['low'], 2)} without reclaim",
         "level":   f"Base: ${round(base['low'], 2)}–${round(base['high'], 2)}",
-        "vol":     "Context only",
-        "score":   score, "action": "Watch now",
+        "vol":     "Context only", "score": score, "action": "Watch now",
         "notes":   "Trend intact, base formed, price pressing lows",
         "trigger_bar_ts": _trigger_bar(r),
     }
@@ -1440,8 +1905,7 @@ def sweep_active_long_v2(c2, p, vw):
         "trigger": f"Undercut in progress below ${round(base['low'], 2)}",
         "inval":   f"No reclaim / continued acceptance below ${round(base['low'], 2)}",
         "level":   f"Base low: ${round(base['low'], 2)} | Current low: ${round(last['l'], 2)}",
-        "vol":     "Live decision zone",
-        "score":   score, "action": "Decision zone",
+        "vol":     "Live decision zone", "score": score, "action": "Decision zone",
         "notes":   "Undercut is happening now — watch for reclaim",
         "trigger_bar_ts": _trigger_bar(r),
     }
@@ -1489,36 +1953,80 @@ def sweep_reclaim_long_v2(c2, p, vw):
         "trigger": f"Reclaim above micro-base low ${round(base_low, 2)}",
         "inval":   f"Loss of sweep low ${round(min(sweep_bar['l'], rcl_bar['l']), 2)}",
         "level":   f"Base: ${round(base_low, 2)}–${round(base_high, 2)} | Next: ${round(base_high, 2)}",
-        "vol":     "Reclaim confirmed",
-        "score":   score,
+        "vol":     "Reclaim confirmed", "score": score,
         "action":  "Actionable" if score >= 70 else "Watch closely",
         "notes":   (f"{'Same-candle' if same_bar else 'Next-candle'} reclaim | "
                     f"{'Green' if is_green(used_bar) else 'Not green'} | "
-                    f"Close: {round(close_pos_in_range(used_bar) * 100, 1)}% of range"),
+                    f"Close: {round(close_pos_in_range(used_bar)*100,1)}% of range"),
         "trigger_bar_ts": _trigger_bar(r),
     }
 
 
 # ──────────────────────────────────────────────────────────────
-# FORMATTERS
+# FORMATTERS — RS tier drives the alert grade label
 # ──────────────────────────────────────────────────────────────
 
-def fmt(ticker, d):
-    sc = d.get("score", 0)
-    em = "🔥" if sc >= 85 else "✅" if sc >= 70 else "⚠️"
-    return "\n".join([
-        f"{em} <b>{ticker} — {d.get('setup')}</b>  {d.get('dir', '')}",
-        f"Confidence: <b>{sc}/100</b>  |  {d.get('action', 'Watch')}",
+def fmt(ticker, d, rs_label="", rs_tier="?"):
+    """
+    Alert formatter.
+
+    The alert GRADE shown at the top is a composite of setup score
+    AND RS tier — a stock touching an EMA with D-tier RS gets a
+    completely different visual treatment than a counter-trend A+ RS.
+
+    Grade logic:
+      Score 85+ AND RS tier A+/A  → 🔥 A+ SETUP
+      Score 70-84 AND RS tier A+/A → ✅ A SETUP
+      Score 70+ AND RS tier B       → ✅ B+ SETUP
+      Score 60-69 OR RS tier C/D    → ⚠️ B/C SETUP — watch only
+      Counter-trend RS (A+)         → always adds ⚡ to header
+    """
+    sc    = d.get("score", 0)
+    setup = d.get("setup", "")
+
+    # Determine composite grade
+    counter_trend = rs_tier == "A+"
+    if sc >= 85 and rs_tier in ("A+", "A"):
+        grade_em    = "🔥"
+        grade_label = "A+ SETUP"
+    elif sc >= 70 and rs_tier in ("A+", "A"):
+        grade_em    = "✅"
+        grade_label = "A SETUP"
+    elif sc >= 70 and rs_tier == "B":
+        grade_em    = "✅"
+        grade_label = "B+ SETUP"
+    elif sc >= 60 and rs_tier in ("B", "?"):
+        grade_em    = "⚠️"
+        grade_label = "B SETUP — watch"
+    elif rs_tier in ("C", "D"):
+        grade_em    = "⚠️"
+        grade_label = "C SETUP — low priority"
+    else:
+        grade_em    = "⚠️"
+        grade_label = "Watch"
+
+    ct_tag = " ⚡" if counter_trend else ""
+
+    header = f"{grade_em}{ct_tag} <b>{ticker} — {setup}</b>  {d.get('dir', '')}"
+    grade  = f"<b>{grade_label}</b>  |  Score: {sc}/100  |  {d.get('action', 'Watch')}"
+
+    rs_line = f"📈 <b>RS [{rs_tier}]:</b> {rs_label}" if rs_label else f"📈 <b>RS:</b> N/A"
+
+    lines = [
+        header,
+        grade,
         "━" * 30,
         f"📍 <b>Trigger:</b> {d.get('trigger', '')}",
         f"🛑 <b>Stop:</b> {d.get('inval', '')}",
         f"🔑 <b>Level:</b> {d.get('level', '')}",
         f"📊 <b>Volume:</b> {d.get('vol', '')}",
+        rs_line,
         f"📝 {d.get('notes', '')}",
         "━" * 30,
         f"⏰ {now_et().strftime('%I:%M %p ET')}",
         f"👉 {d.get('action', 'Review before entry')}",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1540,8 +2048,8 @@ class Scanner:
         self.fired_signals          = {}
         self.session_date           = None
 
-        # SPY data cached per cycle — one call serves all tickers
-        self._spy_pct  = None
+        # SPY data cached per cycle
+        self._spy_ctx  = {"session_pct": None, "atr_pct": None, "recent_dir": "flat"}
         self._spy_last = None
 
     def save_state(self):
@@ -1564,10 +2072,10 @@ class Scanner:
                 old = len(self.fired_signals)
                 self.fired_signals.clear()
                 self.session_date = today
-                self._spy_pct     = None
+                self._spy_ctx  = {"session_pct": None, "atr_pct": None, "recent_dir": "flat"}
                 print(f"[DAILY RESET] Cleared {old} stale signals. Session: {today}")
                 if old > 0:
-                    send_telegram(f"🔄 <b>Daily Reset</b>\nCleared {old} signals from prior session.")
+                    send_alert(f"🔄 <b>Daily Reset</b>\nCleared {old} signals from prior session.")
 
     def purge_expired(self):
         n       = now_et()
@@ -1599,25 +2107,35 @@ class Scanner:
 
     def refresh_spy(self):
         """
-        Fetch SPY session % change once per cycle.
-        All tickers share this value — one API call per 60s loop.
+        Fetch SPY data once per cycle — shared across all tickers.
+        Computes session pct, ATR pct, and recent direction (last 4 bars).
+        The recent direction is what catches the GOOGL-while-SPY-sells scenario.
         """
         try:
             spy_c5 = candles("SPY", 5)
             spy_c5 = closed_only(spy_c5, 5)
-            self._spy_pct  = session_pct_change(spy_c5)
+            self._spy_ctx  = build_spy_context(spy_c5)
             self._spy_last = now_et()
-            print(f"[SPY] Session pct: {self._spy_pct}%")
+            print(f"[SPY] pct={self._spy_ctx['session_pct']}% "
+                  f"atr={self._spy_ctx['atr_pct']}% "
+                  f"dir={self._spy_ctx['recent_dir']}")
         except Exception as e:
             print(f"[SPY ERR] {e}")
-            self._spy_pct = None
+            self._spy_ctx = {"session_pct": None, "atr_pct": None, "recent_dir": "flat"}
 
     def should_fire(self, ticker, setup, bar_ts):
+        """
+        FIX: trigger_bar_ts None guard.
+        If bar_ts is None (setup couldn't determine bar), skip bar comparison
+        and fall through to time-gap check only.
+        """
         key  = (ticker, setup)
         info = self.fired_signals.get(key)
         if info is None:
             return True
-        if bar_ts is not None and info.get("bar_ts") == bar_ts:
+        stored_bar_ts = info.get("bar_ts")
+        # Only do bar comparison when BOTH sides are non-None
+        if bar_ts is not None and stored_bar_ts is not None and bar_ts == stored_bar_ts:
             return False
         gap_min = (now_et() - info["fired_at"]).total_seconds() / 60
         return gap_min >= MIN_REFIRE_GAP_MIN
@@ -1632,10 +2150,12 @@ class Scanner:
     def scan_standard(self, ticker):
         candidates = []
         try:
-            c5_raw = candles(ticker, 5)
-            c1_raw = candles(ticker, 1)
-            c5     = closed_only(c5_raw, 5)
-            c1     = closed_only(c1_raw, 1)
+            c5_raw  = candles(ticker, 5)
+            c1_raw  = candles(ticker, 1)
+            c10_raw = candles(ticker, 10)
+            c5      = closed_only(c5_raw,  5)
+            c1      = closed_only(c1_raw,  1)
+            c10     = closed_only(c10_raw, 10)
             if not c5 or not c1:
                 return candidates
 
@@ -1643,45 +2163,68 @@ class Scanner:
             if not p:
                 return candidates
 
-            vw      = vwap(c5)
-            pmh_v   = self.pmh.get(ticker)
-            pml_v   = self.pml.get(ticker)
-            pd      = self.pr.get(ticker, {})
-            pdh     = pd.get("h")
-            pdl     = pd.get("l")
+            vw    = vwap(c5)
+            pmh_v = self.pmh.get(ticker)
+            pml_v = self.pml.get(ticker)
+            pd    = self.pr.get(ticker, {})
+            pdh   = pd.get("h")
+            pdl   = pd.get("l")
 
-            # ── Quality layer inputs (computed once per ticker) ──
-            rvol    = calc_rvol(c5)
-            tkr_pct = session_pct_change(c5)
-            rs_mod, rs_label = relative_strength_vs_spy(tkr_pct, self._spy_pct)
+            # Quality inputs — computed once per ticker
+            rvol             = calc_rvol(c5)
+            tkr_pct          = session_pct_change(c5)
+            tkr_atr_pct      = atr_pct(c5)
+            tkr_recent_dir   = recent_direction(c5, lookback=4)
+
+            # Full direction-aware RS grading — catches counter-trend strength
+            rs_mod, rs_label, rs_tier = grade_rs(
+                tkr_pct, tkr_atr_pct, tkr_recent_dir,
+                self._spy_ctx, direction="long"   # per-setup direction handled below
+            )
+            # Short setups get inverted RS — computed separately in each short setup call
+            rs_mod_short, rs_label_short, rs_tier_short = grade_rs(
+                tkr_pct, tkr_atr_pct, tkr_recent_dir,
+                self._spy_ctx, direction="short"
+            )
 
             setups = [
+                # ── LONG setups — use long RS ──
                 ("ORB_5M_LONG",
-                 lambda: orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod)),
+                 lambda: orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod, rs_tier)),
                 ("ORB_15M_LONG",
-                 lambda: orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod)),
+                 lambda: orb_15m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod, rs_tier)),
                 ("PMH_BREAK_RETEST_LONG",
-                 lambda: pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod)),
-                ("PML_BREAK_RETEST_SHORT",
-                 lambda: pml_retest(c5, p, vw, pml_v, rvol, rs_mod)),
+                 lambda: pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod, rs_tier)),
                 ("VWAP_RECLAIM_LONG",
-                 lambda: vwap_reclaim(c5, p, vw, rvol, rs_mod)),
-                ("VWAP_REJECT_SHORT",
-                 lambda: vwap_reject(c5, p, vw, rvol, rs_mod)),
+                 lambda: vwap_reclaim(c5, p, vw, rvol, rs_mod, rs_tier)),
                 ("EMA9_5M_PULLBACK_LONG",
-                 lambda: ema9_pb_long(c5, p, vw, rvol, rs_mod)),
-                ("EMA9_5M_PULLBACK_SHORT",
-                 lambda: ema9_pb_short(c5, p, vw, rvol, rs_mod)),
+                 lambda: ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier)),
+                ("EMA9_10M_PULLBACK_LONG",
+                 lambda: ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier) if c10 else (False, {})),
+                ("EMA4_10M_RIDER_LONG",
+                 lambda: ema4_10m_rider_long(c10, p, vw, rvol, rs_mod, rs_tier) if c10 else (False, {})),
                 ("FLAG_BREAKOUT_LONG",
-                 lambda: flag_long(c5, p, vw, rvol, rs_mod)),
+                 lambda: flag_long(c5, p, vw, rvol, rs_mod, rs_tier)),
                 ("PDH_BREAK_RETEST_LONG",
-                 lambda: pdh_retest(c5, p, vw, pdh, rvol, rs_mod)),
-                ("PDL_BREAK_RETEST_SHORT",
-                 lambda: pdl_retest(c5, p, vw, pdl, rvol, rs_mod)),
+                 lambda: pdh_retest(c5, p, vw, pdh, rvol, rs_mod, rs_tier)),
                 ("LATER_DAY_HOD_BREAKOUT",
-                 lambda: later_day_hod_breakout(c5, p, vw, rvol, rs_mod)),
+                 lambda: later_day_hod_breakout(c5, p, vw, rvol, rs_mod, rs_tier)),
                 ("FIB_PULLBACK_LONG",
                  lambda: fib_pullback_long(c5, p, vw, rvol)),
+
+                # ── SHORT setups — use short RS (inverted) ──
+                ("PML_BREAK_RETEST_SHORT",
+                 lambda: pml_retest(c5, p, vw, pml_v, rvol, rs_mod_short, rs_tier_short)),
+                ("VWAP_REJECT_SHORT",
+                 lambda: vwap_reject(c5, p, vw, rvol, rs_mod_short, rs_tier_short)),
+                ("EMA9_5M_PULLBACK_SHORT",
+                 lambda: ema9_pb_short(c5, p, vw, rvol, rs_mod_short, rs_tier_short)),
+                ("EMA9_10M_PULLBACK_SHORT",
+                 lambda: ema9_pb_short_10m(c10, p, vw, rvol, rs_mod_short, rs_tier_short) if c10 else (False, {})),
+                ("EMA4_10M_RIDER_SHORT",
+                 lambda: ema4_10m_rider_short(c10, p, vw, rvol, rs_mod_short, rs_tier_short) if c10 else (False, {})),
+                ("PDL_BREAK_RETEST_SHORT",
+                 lambda: pdl_retest(c5, p, vw, pdl, rvol, rs_mod_short, rs_tier_short)),
                 ("FIB_PULLBACK_SHORT",
                  lambda: fib_pullback_short(c5, p, vw, rvol)),
             ]
@@ -1696,8 +2239,10 @@ class Scanner:
                     bar_ts = d.get("trigger_bar_ts")
                     if not self.should_fire(ticker, name, bar_ts):
                         continue
-                    # Append RS label to notes for context
-                    d["notes"] = d.get("notes", "") + f" | {rs_label}"
+                    # Tag correct RS label based on direction
+                    is_short = "SHORT" in name
+                    d["_rs_label"] = rs_label_short if is_short else rs_label
+                    d["_rs_tier"]  = rs_tier_short  if is_short else rs_tier
                     candidates.append((name, d))
                 except Exception as e:
                     print(f"[SETUP ERR] {ticker}:{name}:{e}")
@@ -1749,104 +2294,115 @@ class Scanner:
 
     def cmd(self, command):
         global MIN_SCORE
+        # FIX: normalize input — strip whitespace, handle encoding issues
         pts = command.strip().split()
         c   = pts[0].lower() if pts else ""
 
         if c == "/watch" and len(pts) >= 2:
             added = []
             for raw in pts[1:]:
-                t = raw.upper()
-                if t not in self.wl:
+                t = raw.upper().strip()   # FIX: explicit strip
+                if t and t not in self.wl:
                     self.wl.append(t)
                     added.append(t)
             self.save_state()
-            send_telegram(f"✅ Added: {', '.join(added) if added else 'none'}\nWatching {len(self.wl)} stocks")
+            send_alert(f"✅ Added: {', '.join(added) if added else 'none'}\nWatching {len(self.wl)} stocks")
 
         elif c == "/remove" and len(pts) >= 2:
             removed = []
             for raw in pts[1:]:
-                t = raw.upper()
-                if t in self.wl:
-                    self.wl = [x for x in self.wl if x != t]
+                t = raw.upper().strip()   # FIX: explicit strip
+                # FIX: rebuild list with normalized comparison
+                before = len(self.wl)
+                self.wl = [x for x in self.wl if x.upper().strip() != t]
+                if len(self.wl) < before:
                     self.armed.discard(t)
                     removed.append(t)
             self.save_state()
-            send_telegram(f"🗑️ Removed: {', '.join(removed) if removed else 'none'}")
+            send_alert(f"🗑️ Removed: {', '.join(removed) if removed else 'none (not found)'}")
 
         elif c == "/arm" and len(pts) >= 2:
             armed_now = []
             for raw in pts[1:]:
-                t = raw.upper()
+                t = raw.upper().strip()
                 if t not in self.wl:
                     self.wl.append(t)
                 self.armed.add(t)
                 armed_now.append(t)
             self.save_state()
-            send_telegram(f"🎯 Armed sweep logic for: {', '.join(armed_now)}")
+            send_alert(f"🎯 Armed sweep logic for: {', '.join(armed_now)}")
 
         elif c == "/disarm" and len(pts) >= 2:
             removed = []
             for raw in pts[1:]:
-                t = raw.upper()
+                t = raw.upper().strip()
                 if t in self.armed:
                     self.armed.discard(t)
                     removed.append(t)
             self.save_state()
-            send_telegram(f"🧹 Disarmed: {', '.join(removed) if removed else 'none'}")
+            send_alert(f"🧹 Disarmed: {', '.join(removed) if removed else 'none'}")
 
         elif c == "/armed":
-            send_telegram(f"🎯 Armed ({len(self.armed)}):\n{', '.join(sorted(self.armed)) or 'none'}")
+            send_alert(f"🎯 Armed ({len(self.armed)}):\n{', '.join(sorted(self.armed)) or 'none'}")
 
         elif c == "/list":
-            send_telegram(f"📋 Watching ({len(self.wl)}):\n{', '.join(self.wl)}")
+            send_alert(f"📋 Watching ({len(self.wl)}):\n{', '.join(self.wl)}")
 
         elif c == "/status":
-            spy_str = f"{self._spy_pct}%" if self._spy_pct is not None else "N/A"
-            send_telegram(
-                f"📊 <b>Scanner v3.6</b>\n"
+            spy = self._spy_ctx
+            spy_str = (f"{spy.get('session_pct','N/A')}% | "
+                       f"dir={spy.get('recent_dir','?')} | "
+                       f"ATR={spy.get('atr_pct','N/A')}%")
+            send_alert(
+                f"📊 <b>Scanner v3.9</b>\n"
                 f"Stocks: {len(self.wl)} | Armed: {len(self.armed)}\n"
                 f"Min score: {MIN_SCORE}/100\n"
                 f"Active fired signals: {len(self.fired_signals)}\n"
-                f"SPY session: {spy_str}\n"
+                f"SPY: {spy_str}\n"
                 f"Session: {self.session_date}\n"
                 f"RVOL min gate: {RVOL_MIN}x\n"
-                f"5m ORB cutoff: 9:45 ET | 15m ORB: 9:45–10:05 ET\n"
                 f"Earnings tags: {', '.join(sorted(self.earnings)) or 'none'}"
             )
 
         elif c == "/setups":
-            send_telegram(
-                "📊 <b>Active Setups (v3.6)</b>\n"
-                "1. ORB 5m Long\n2. ORB 15m Long\n3. PM High Retest Long\n"
-                "4. PM Low Retest Short\n5. VWAP Reclaim Long\n6. VWAP Reject Short\n"
-                "7. 9 EMA Pullback Long\n8. 9 EMA Pullback Short\n9. Flag Breakout Long\n"
-                "10. PDH Retest Long\n11. PDL Retest Short\n12. Later-Day HOD Breakout\n"
-                "<b>NEW:</b>\n"
-                "13. Fib Pullback Long (38.2/50/61.8%)\n"
-                "14. Fib Pullback Short (38.2/50/61.8%)\n"
+            send_alert(
+                "📊 <b>Active Setups (v3.8)</b>\n"
+                "1. ORB 5m Long | 2. ORB 15m Long\n"
+                "3. PM High Retest | 4. PM Low Retest\n"
+                "5. VWAP Reclaim | 6. VWAP Reject\n"
+                "7. EMA9 5m PB Long | 8. EMA9 5m PB Short\n"
+                "9. EMA9 10m PB Long | 10. EMA9 10m PB Short\n"
+                "11. EMA4 10m Rider Long | 12. EMA4 10m Rider Short\n"
+                "13. Flag Breakout Long\n"
+                "14. PDH Retest | 15. PDL Retest\n"
+                "16. Later-Day HOD Breakout\n"
+                "17. Fib Pullback Long | 18. Fib Pullback Short\n"
                 "<b>Armed only:</b>\n"
-                "15. Sweep Watch | 16. Sweep Active | 17. Sweep Reclaim Long\n\n"
-                "<b>Quality layers on all setups:</b>\n"
-                "• RVOL gate (min 1.5x)\n"
-                "• Relative strength vs SPY\n"
-                "• Time-of-day score modifier"
+                "19. Sweep Watch | 20. Sweep Active | 21. Sweep Reclaim\n\n"
+                "<b>RS Grades (shown on every alert):</b>\n"
+                "⚡ A+ = Counter-trend (+15) — stock vs market\n"
+                "✅ A  = Strong normalized RS (+10)\n"
+                "✅ B+ = Good RS (+5)\n"
+                "⚠️ B  = Neutral — market doing the work\n"
+                "⚠️ C  = Weak RS (-5 to -10)\n"
+                "⚠️ D  = Lagging (-12 to -18) — suppressed"
             )
 
         elif c == "/threshold" and len(pts) == 2:
             try:
                 MIN_SCORE = int(pts[1])
-                send_telegram(f"⚙️ Min score: {MIN_SCORE}/100")
+                send_alert(f"⚙️ Min score: {MIN_SCORE}/100")
             except Exception:
-                send_telegram("❌ Usage: /threshold 65")
+                send_alert("❌ Usage: /threshold 65")
 
         elif c == "/reset":
             old = len(self.fired_signals)
             self.fired_signals.clear()
-            send_telegram(f"🔄 Cleared {old} fired signals. Scanner reset.")
+            send_alert(f"🔄 Cleared {old} fired signals. Scanner reset.")
 
         elif c == "/fired":
             if not self.fired_signals:
-                send_telegram("📭 No active fired signals.")
+                send_alert("📭 No active fired signals.")
             else:
                 n     = now_et()
                 lines = ["📋 <b>Active fired signals:</b>"]
@@ -1854,22 +2410,22 @@ class Scanner:
                     age = int((n - info["fired_at"]).total_seconds() / 60)
                     ttl = SIGNAL_TTL.get(s, DEFAULT_TTL)
                     lines.append(f"• {t} {s} — {age}m old (TTL {ttl}m)")
-                send_telegram("\n".join(lines))
+                send_alert("\n".join(lines))
 
         elif c == "/earnings" and len(pts) >= 2:
-            added = [raw.upper() for raw in pts[1:]]
+            added = [raw.upper().strip() for raw in pts[1:]]
             for t in added:
                 self.earnings.add(t)
-            send_telegram(f"📋 Earnings flagged: {', '.join(added)}")
+            send_alert(f"📋 Earnings flagged: {', '.join(added)}")
 
         elif c == "/unearnings" and len(pts) >= 2:
             removed = []
             for raw in pts[1:]:
-                t = raw.upper()
+                t = raw.upper().strip()
                 if t in self.earnings:
                     self.earnings.remove(t)
                     removed.append(t)
-            send_telegram(f"🧹 Earnings unflagged: {', '.join(removed) if removed else 'none'}")
+            send_alert(f"🧹 Earnings unflagged: {', '.join(removed) if removed else 'none'}")
 
         elif c == "/auth" and len(pts) >= 2:
             _complete_auth(" ".join(pts[1:]))
@@ -1880,7 +2436,7 @@ class Scanner:
             threading.Thread(target=_login, daemon=True).start()
 
         else:
-            send_telegram(
+            send_alert(
                 "Commands:\n"
                 "/watch /remove /arm /disarm /armed /list\n"
                 "/status /setups /threshold 65\n"
@@ -1889,16 +2445,17 @@ class Scanner:
             )
 
     def run(self):
-        print("[SCANNER] v3.6 starting")
-        send_telegram(
-            f"🤖 <b>Scanner v3.6 Online</b>\n{'━' * 28}\n"
+        print("[SCANNER] v3.9 starting")
+        send_alert(
+            f"🤖 <b>Scanner v3.9 Online</b>\n{'━' * 28}\n"
             f"Watching <b>{len(self.wl)} stocks</b> | Armed <b>{len(self.armed)}</b>\n"
             f"Threshold ≥ {MIN_SCORE}/100\n{'━' * 28}\n"
-            f"<b>New in v3.6:</b>\n"
-            f"• Fib pullback setup (38.2 / 50 / 61.8%)\n"
-            f"• RVOL gate on all setups (min {RVOL_MIN}x)\n"
-            f"• Relative strength vs SPY scoring\n"
-            f"• Time-of-day score modifier\n\n"
+            f"<b>New in v3.8 — Direction-Aware RS:</b>\n"
+            f"• ⚡ Counter-trend RS (+15) — stock vs market\n"
+            f"• ATR-normalized scoring (GOOGL-type moves captured)\n"
+            f"• SPY recent direction tracked every cycle\n"
+            f"• Alert grade A+/A/B/C/D shown on every alert\n"
+            f"• Short RS computed separately (inverted)\n\n"
             f"Commands: /status /setups /fired /reset"
         )
 
@@ -1911,14 +2468,16 @@ class Scanner:
             self.maybe_daily_reset()
             self.purge_expired()
             self.refresh()
-            self.refresh_spy()   # one SPY call per cycle, shared across all tickers
+            self.refresh_spy()
 
             for t in list(self.wl):
                 print(f"[SCAN] {t}...")
                 try:
                     for name, d in self.scan_standard(t):
-                        bar_ts = d.get("trigger_bar_ts")
-                        send_telegram(fmt(t, d))
+                        bar_ts   = d.get("trigger_bar_ts")
+                        rs_label = d.pop("_rs_label", "")
+                        rs_tier  = d.pop("_rs_tier",  "?")
+                        send_alert(fmt(t, d, rs_label, rs_tier))
                         self.mark_fired(t, name, bar_ts, d.get("score", 0))
                         time.sleep(1)
                 except Exception as e:
@@ -1927,7 +2486,7 @@ class Scanner:
                 try:
                     for name, d in self.scan_sweep(t):
                         bar_ts = d.get("trigger_bar_ts")
-                        send_telegram(fmt(t, d))
+                        send_alert(fmt(t, d))
                         self.mark_fired(t, name, bar_ts, d.get("score", 0))
                         time.sleep(1)
                 except Exception as e:
@@ -1968,7 +2527,7 @@ def listen(sc):
 
 if __name__ == "__main__":
     print(
-        f"[MAIN] v3.6 | Schwab:{'OK' if SCHWAB_CLIENT_ID else 'MISSING'} | "
+        f"[MAIN] v3.8 | Schwab:{'OK' if SCHWAB_CLIENT_ID else 'MISSING'} | "
         f"Telegram:{'OK' if TELEGRAM_TOKEN else 'MISSING'}"
     )
     sc = Scanner()
