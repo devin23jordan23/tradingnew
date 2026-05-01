@@ -1,5 +1,5 @@
 """
-main.py — Andre's Trading Scanner v3.9
+main.py — Andre's Trading Scanner v3.10
 
 CHANGES FROM v3.6
 ─────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ SIGNAL_TTL = {
 }
 DEFAULT_TTL = 15
 
-MIN_REFIRE_GAP_MIN = 20
+MIN_REFIRE_GAP_MIN = 30  # raised from 20 — a setup that fired 20min ago on same conditions is stale
 
 # Quality layer constants
 RVOL_MIN       = 1.5
@@ -331,16 +331,40 @@ def _expired(t):
 
 
 def _refresh_tokens(t):
+    """
+    Refresh the access token using the refresh token.
+    Schwab refresh tokens expire after 7 days — if the refresh itself
+    fails with a 4xx, the refresh token is dead and we need a full
+    re-auth. Catch that specifically and trigger _login() instead of
+    crashing silently, which was causing the daily auth drop.
+    """
     headers = {"Authorization": f"Basic {_b64()}", "Content-Type": "application/x-www-form-urlencoded"}
-    r = requests.post(TOKEN_URL, headers=headers,
-                      data={"grant_type": "refresh_token", "refresh_token": t.get("refresh_token", "")},
-                      timeout=15)
-    r.raise_for_status()
-    new_t = r.json()
-    if "refresh_token" not in new_t:
-        new_t["refresh_token"] = t.get("refresh_token")
-    _save_tokens(new_t)
-    return new_t
+    try:
+        r = requests.post(TOKEN_URL, headers=headers,
+                          data={"grant_type": "refresh_token", "refresh_token": t.get("refresh_token", "")},
+                          timeout=15)
+        # 4xx on refresh = refresh token is expired or invalid — need full re-auth
+        if r.status_code in (400, 401, 403):
+            print(f"[AUTH] Refresh token expired ({r.status_code}). Triggering re-auth.")
+            send_telegram(
+                "🔐 <b>Schwab session expired</b>\n"
+                "Refresh token is no longer valid (7-day limit).\n"
+                "Send /reauth to reconnect."
+            )
+            return {}   # empty dict — tok() will trigger _login() on next call
+        r.raise_for_status()
+        new_t = r.json()
+        if "refresh_token" not in new_t:
+            new_t["refresh_token"] = t.get("refresh_token")
+        _save_tokens(new_t)
+        print(f"[AUTH] Tokens refreshed successfully.")
+        return new_t
+    except requests.exceptions.HTTPError as e:
+        print(f"[AUTH REFRESH ERR] {e}")
+        return {}
+    except Exception as e:
+        print(f"[AUTH REFRESH ERR] {e}")
+        return t   # return old tokens on network error — don't wipe them
 
 
 def _login():
@@ -399,6 +423,11 @@ def tok():
             return ""
     elif _expired(t):
         t = _refresh_tokens(t)
+        # If refresh returned empty (refresh token expired), trigger full login
+        if not t or not t.get("access_token"):
+            t = _login()
+            if not t:
+                return ""
     return t.get("access_token", "")
 
 
@@ -1226,22 +1255,30 @@ def vwap_reject(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     """
     9 EMA pullback long — 5-minute bars.
-    Price must have been ABOVE the EMA for prior bars before touching.
-    Filters out resistance tests from below.
+    HARD GATES (checked before anything else):
+    - Price must be ABOVE VWAP. Below VWAP = no long EMA setup, period.
+    - Price must have been ABOVE the EMA for prior bars (direction context).
+    Both conditions exist in the scoring logic but were not catching all
+    cases. Making them hard exits before any further evaluation.
     """
     r = rh(c5)
     if len(r) < 14:
         return False, {}
+
+    # HARD GATE 1 — must be above VWAP. Non-negotiable for longs.
+    if vw and p <= vw:
+        return False, {}
+
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
     en  = es[-1]
     if en is None:
         return False, {}
 
-    # Direction context — CRITICAL FIX
+    # HARD GATE 2 — must have approached from above
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
     if ctx != "from_above":
-        return False, {}    # price was below EMA — this is a resistance test, not a pullback
+        return False, {}
 
     ema_vals   = [e for e in es[-5:] if e is not None]
     rising     = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
@@ -1252,7 +1289,7 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     _, _, vol_ratio = vol_baseline(c5)
     light_pb   = vol_ratio is not None and vol_ratio <= 0.80
 
-    if not (rising and above_vwap and touched and bouncing):
+    if not (rising and touched and bouncing):
         return False, {}
 
     score = _apply_quality_modifiers(
@@ -1276,22 +1313,25 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     """
     9 EMA pullback short — 5-minute bars.
-    Price must have been BELOW the EMA for prior bars before bouncing.
-    Filters out support tests from above.
+    HARD GATE: price must be BELOW VWAP. Above VWAP = no short EMA setup.
     """
     r = rh(c5)
     if len(r) < 14:
         return False, {}
+
+    # HARD GATE — must be below VWAP for shorts
+    if vw and p >= vw:
+        return False, {}
+
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
     en  = es[-1]
     if en is None:
         return False, {}
 
-    # Direction context
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
     if ctx != "from_below":
-        return False, {}    # price was above EMA — this is a support test, not a short setup
+        return False, {}
 
     ema_vals  = [e for e in es[-5:] if e is not None]
     falling   = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
@@ -1302,7 +1342,7 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     _, _, vol_ratio = vol_baseline(c5)
     light_bounce = vol_ratio is not None and vol_ratio <= 0.80
 
-    if not (falling and below_vwap and touched and rejecting):
+    if not (falling and touched and rejecting):
         return False, {}
 
     score = _apply_quality_modifiers(
@@ -1324,13 +1364,11 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 
 
 def ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
-    """
-    9 EMA pullback long — 10-minute bars.
-    Higher timeframe = higher quality confirmation, higher base score.
-    Requires 5 bars above EMA before touch (stricter than 5-min).
-    """
+    """10-min EMA9 pullback long. Hard VWAP gate: must be above VWAP."""
     r = rh(c10)
     if len(r) < 12:
+        return False, {}
+    if vw and p <= vw:   # HARD GATE — no long below VWAP
         return False, {}
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
@@ -1374,9 +1412,11 @@ def ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
 
 
 def ema9_pb_short_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
-    """9 EMA pullback short on 10-minute bars."""
+    """10-min EMA9 pullback short. Hard VWAP gate: must be below VWAP."""
     r = rh(c10)
     if len(r) < 12:
+        return False, {}
+    if vw and p >= vw:   # HARD GATE — no short above VWAP
         return False, {}
     cls = [c["c"] for c in r]
     es  = ema_series(cls, 9)
@@ -1622,46 +1662,77 @@ def flag_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 
 
 def pdh_retest(c5, p, vw, pdh, rvol, rs_mod, rs_tier="?"):
+    """
+    PDH Break + Retest Long.
+
+    Root bug fix: was firing when price was near PDH from BELOW —
+    a stock approaching PDH from the downside is resistance, not a breakout.
+
+    Correct conditions:
+    1. Price must have CLEANLY broken above PDH earlier today
+       (a bar must have CLOSED above PDH, not just spiked through)
+    2. Price pulled back to retest PDH from ABOVE (now treating it as support)
+    3. Price is currently holding at or above PDH
+    4. Above VWAP — trend context confirmed
+    """
     if not pdh:
         return False, {}
     r = rh(c5)
     if len(r) < 3:
         return False, {}
-    if not any(c["h"] > pdh for c in r[:-2]):
+
+    # HARD FIX: require a CLOSED bar above PDH, not just a high spike
+    # A spike that closed back below is not a valid break
+    clean_break = any(c["c"] > pdh for c in r[:-2])
+    if not clean_break:
         return False, {}
-    near       = abs(p - pdh) / pdh <= 0.005
+
+    # HARD FIX: price must be above PDH now (holding, not approaching from below)
+    # If price is below PDH it is approaching from the downside — that is NOT this setup
+    if p < pdh * 0.997:
+        return False, {}
+
+    near       = abs(p - pdh) / pdh <= 0.005   # within 0.5% of PDH = retest zone
     above      = p >= pdh * 0.998
     above_vwap = p > (vw or 0)
     _, _, vol_ratio = vol_baseline(c5)
     light_pb   = vol_ratio is not None and vol_ratio <= 0.85
+
     if not (above and above_vwap):
         return False, {}
+
     score = _apply_quality_modifiers(
         70 + (10 if near else 0) + (10 if light_pb else 0) + (5 if above_vwap else 0),
-        rvol, rs_mod
+        rvol, rs_mod, rs_tier
     )
     if score < MIN_SCORE:
         return False, {}
     return True, {
         "setup": "PDH_BREAK_RETEST_LONG", "dir": "🟢 LONG",
-        "trigger": f"Reclaim above PDH ${round(pdh, 2)} + push",
-        "inval":   f"Loss of ${round(pdh * 0.997, 2)}",
+        "trigger": f"Holding above PDH ${round(pdh, 2)} after clean break",
+        "inval":   f"Close back below ${round(pdh * 0.997, 2)}",
         "level":   f"Prior Day High: ${round(pdh, 2)}",
         "vol":     f"Pullback light ✅ RVOL {rvol}x" if light_pb else f"Watch RVOL {rvol}x",
         "score":   score,
         "action":  "Actionable" if near and above_vwap else "Watch",
-        "notes":   "Daily breakout — institutional level",
+        "notes":   "Daily breakout retest — closed above PDH + holding as support",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
 
 def pdl_retest(c5, p, vw, pdl, rvol, rs_mod, rs_tier="?"):
+    """PDL Break + Retest Short. Must have CLOSED below PDL and still be below it."""
     if not pdl:
         return False, {}
     r = rh(c5)
     if len(r) < 3:
         return False, {}
-    if not any(c["l"] < pdl for c in r[:-2]):
+    # Must have a closed bar below PDL (not just a wick)
+    clean_break = any(c["c"] < pdl for c in r[:-2])
+    if not clean_break:
+        return False, {}
+    # Must currently be below PDL — not approaching from above
+    if p > pdl * 1.003:
         return False, {}
     near         = abs(p - pdl) / pdl <= 0.005
     below        = p <= pdl * 1.002
@@ -1672,19 +1743,19 @@ def pdl_retest(c5, p, vw, pdl, rvol, rs_mod, rs_tier="?"):
         return False, {}
     score = _apply_quality_modifiers(
         70 + (10 if near else 0) + (10 if light_bounce else 0),
-        rvol, -rs_mod
+        rvol, -rs_mod, rs_tier
     )
     if score < MIN_SCORE:
         return False, {}
     return True, {
         "setup": "PDL_BREAK_RETEST_SHORT", "dir": "🔴 SHORT",
-        "trigger": f"Reject under PDL ${round(pdl, 2)} + break low",
-        "inval":   f"Reclaim ${round(pdl * 1.003, 2)}",
+        "trigger": f"Reject under PDL ${round(pdl, 2)} after clean close below",
+        "inval":   f"Reclaim above ${round(pdl * 1.003, 2)}",
         "level":   f"Prior Day Low: ${round(pdl, 2)}",
         "vol":     f"Bounce light ✅ RVOL {rvol}x" if light_bounce else f"Watch RVOL {rvol}x",
         "score":   score,
         "action":  "Actionable" if near and below_vwap else "Watch",
-        "notes":   "Prior day low broke — institutional breakdown",
+        "notes":   "Prior day low broke — holding below as resistance",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
@@ -2240,9 +2311,14 @@ class Scanner:
                     if not self.should_fire(ticker, name, bar_ts):
                         continue
                     # Tag correct RS label based on direction
-                    is_short = "SHORT" in name
+                    is_short   = "SHORT" in name
+                    alert_tier = rs_tier_short if is_short else rs_tier
+                    # HARD GATE: suppress C and D tier alerts entirely
+                    # You only want B and better. C/D = low RS, not your edge.
+                    if alert_tier in ("C", "D"):
+                        continue
                     d["_rs_label"] = rs_label_short if is_short else rs_label
-                    d["_rs_tier"]  = rs_tier_short  if is_short else rs_tier
+                    d["_rs_tier"]  = alert_tier
                     candidates.append((name, d))
                 except Exception as e:
                     print(f"[SETUP ERR] {ticker}:{name}:{e}")
@@ -2354,7 +2430,7 @@ class Scanner:
                        f"dir={spy.get('recent_dir','?')} | "
                        f"ATR={spy.get('atr_pct','N/A')}%")
             send_alert(
-                f"📊 <b>Scanner v3.9</b>\n"
+                f"📊 <b>Scanner v3.10</b>\n"
                 f"Stocks: {len(self.wl)} | Armed: {len(self.armed)}\n"
                 f"Min score: {MIN_SCORE}/100\n"
                 f"Active fired signals: {len(self.fired_signals)}\n"
@@ -2445,9 +2521,9 @@ class Scanner:
             )
 
     def run(self):
-        print("[SCANNER] v3.9 starting")
+        print("[SCANNER] v3.10 starting")
         send_alert(
-            f"🤖 <b>Scanner v3.9 Online</b>\n{'━' * 28}\n"
+            f"🤖 <b>Scanner v3.10 Online</b>\n{'━' * 28}\n"
             f"Watching <b>{len(self.wl)} stocks</b> | Armed <b>{len(self.armed)}</b>\n"
             f"Threshold ≥ {MIN_SCORE}/100\n{'━' * 28}\n"
             f"<b>New in v3.8 — Direction-Aware RS:</b>\n"
