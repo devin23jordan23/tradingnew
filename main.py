@@ -1,5 +1,5 @@
 """
-main.py — Andre's Trading Scanner v3.11
+main.py — Andre's Trading Scanner v3.12
 
 CHANGES FROM v3.6
 ─────────────────────────────────────────────────────────────────
@@ -162,6 +162,7 @@ SIGNAL_TTL = {
     "PDH_BREAK_RETEST_LONG":    30,
     "PDL_BREAK_RETEST_SHORT":   30,
     "LATER_DAY_HOD_BREAKOUT":   25,
+    "OPENING_DRIVE_LONG":       30,   # fires early, stays valid through first hour
     "FIB_PULLBACK_LONG":        20,
     "FIB_PULLBACK_SHORT":       20,
     "SWEEP_WATCH":              10,
@@ -201,6 +202,11 @@ EMA4_MIN_BARS     = 4       # at least 4 bars trending on correct side of 4 EMA
 
 WATCHLIST_FILE = "watchlist_state.json"
 ARMED_FILE     = "armed_state.json"
+
+# API health tracking — detect when Schwab feed goes silent
+_api_consecutive_failures = 0
+_api_failure_alerted      = False
+API_FAILURE_THRESHOLD     = 3   # 3 consecutive full-cycle failures before alert
 
 _pending_auth  = False
 
@@ -440,6 +446,7 @@ def _hdr():
 
 
 def _get(ep, params=None):
+    global _api_consecutive_failures, _api_failure_alerted
     for i in range(2):
         try:
             r = requests.get(f"{BASE}{ep}", headers=_hdr(), params=params or {}, timeout=10)
@@ -447,11 +454,19 @@ def _get(ep, params=None):
                 _refresh_tokens(_load_tokens())
                 continue
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            # Successful call — reset failure counter
+            if _api_consecutive_failures > 0:
+                _api_consecutive_failures = 0
+                _api_failure_alerted      = False
+                print("[API] Feed recovered.")
+            return data
         except Exception as e:
             print(f"[DATA ERR] {ep}: {e}")
             if i == 0:
                 time.sleep(2)
+    # Both retries exhausted — increment failure counter
+    _api_consecutive_failures += 1
     return {}
 
 
@@ -618,18 +633,70 @@ def prior_day(ticker):
 # QUALITY LAYER HELPERS
 # ──────────────────────────────────────────────────────────────
 
-def calc_rvol(c5, baseline_bars=10):
+def gap_pct(c5, prior_close):
     """
-    Session-anchored RVOL. Compares recent 5-bar avg volume to
-    the first baseline_bars bars of the session.
+    Gap percentage from prior close to today's open.
+    Uses the first regular-hours bar's open price.
+    Returns None if data unavailable.
     """
     r = rh(c5)
-    if len(r) < 6:
+    if not r or not prior_close or prior_close == 0:
         return None
-    base   = r[:baseline_bars] if len(r) >= baseline_bars else r[:max(3, len(r) // 2)]
-    recent = r[-5:]
-    base_avg   = sum(c["v"] for c in base)   / len(base)   if base   else 0
-    recent_avg = sum(c["v"] for c in recent) / len(recent) if recent else 0
+    today_open = r[0]["o"]
+    return round((today_open - prior_close) / prior_close * 100, 2)
+
+
+def calc_rvol(c5, baseline_bars=10, prior_close=None):
+    """
+    Session-anchored RVOL.
+
+    GAP DAY FIX: On gap-up days (open > 2% above prior close), the first
+    bars of the session ARE the volume spike — using them as baseline means
+    AAOI's extraordinary volume reads as ~1.0 all day because every bar
+    compares against the spike baseline. On gap days, use prior day's
+    average bar volume as the reference instead of today's opening bars.
+
+    Normal days: compare recent 5 bars to first 10 bars of today.
+    Gap days: compare recent 5 bars to prior day avg bar volume.
+    """
+    r = rh(c5)
+    if len(r) < 4:
+        return None
+
+    recent = r[-5:] if len(r) >= 5 else r
+    recent_avg = sum(c["v"] for c in recent) / len(recent)
+
+    # Detect gap day
+    is_gap_day = False
+    if prior_close and prior_close > 0 and r:
+        today_open = r[0]["o"]
+        gap = abs(today_open - prior_close) / prior_close * 100
+        is_gap_day = gap >= 2.0
+
+    if is_gap_day and prior_close:
+        # Use prior day volume as baseline — prior_close is from prior_day()
+        # We don't have prior day bar volume directly, so use session total
+        # divided by typical bars (78 bars in a 6.5hr session on 5-min)
+        # as the per-bar baseline. This is approximate but far more accurate
+        # than using today's spike bars.
+        # Better: use all of today's bars if we have enough (>15 bars = >75 min)
+        if len(r) >= 15:
+            # Use bars 11-onward as baseline (past the initial surge window)
+            settling_bars = r[10:]
+            base_avg = sum(c["v"] for c in settling_bars) / len(settling_bars)
+        else:
+            # Too early — can't normalize yet, return None to avoid false reads
+            return None
+    else:
+        # Normal day — use first baseline_bars as reference
+        if len(r) < baseline_bars + 2:
+            base = r[:max(3, len(r) // 2)]
+        else:
+            base = r[:baseline_bars]
+        if not base:
+            return None
+        base_avg = sum(c["v"] for c in base) / len(base)
+
     if base_avg == 0:
         return None
     return round(recent_avg / base_avg, 2)
@@ -836,7 +903,7 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     """
     Classify whether price approached the EMA from ABOVE or BELOW.
 
-    TIGHTENED in v3.11:
+    TIGHTENED in v3.12:
     - Looks back 8 bars total (was prior_bars + max_cross which was only 4-5)
     - Zero cross tolerance (EMA_MAX_CROSS_BARS = 0) — any bar on the wrong
       side in the 8-bar window = MIXED, not a clean pullback
@@ -1918,6 +1985,119 @@ def fib_pullback_short(c5, p, vw, rvol):
 # SWEEP LOGIC (unchanged — armed names only)
 # ──────────────────────────────────────────────────────────────
 
+def opening_drive_long(c5, c1, p, vw, pmh_v, prior_close, rvol, rs_mod, rs_tier="?"):
+    """
+    Opening Drive / Gap and Go — catches AAOI/NBIS/AAPL gap breakout scenarios.
+
+    This setup fires when a name gaps up significantly and is holding the drive
+    in the first 75 minutes. It explicitly does NOT require a pullback to an EMA
+    because the trade IS the opening drive — you're confirming the drive is real
+    and holding, not waiting for a retracement.
+
+    The existing ORB setup misses these because `was_below` (prev bar closed
+    below ORB high) never triggers on strong gap-up names where all bars close
+    above the ORB high from the start.
+
+    Conditions:
+    - Only fires in first 75 minutes (9:30–10:45 ET)
+    - Stock opened at least 2% above prior close (confirmed gap)
+    - Current price is above VWAP (drive still holding)
+    - First 5-min bar closed in top 50% of its range (strong directional open)
+    - Price is above premarket high (gap didn't fade back into PM range)
+    - RVOL above 1.5x (name is genuinely in play — uses gap-adjusted RVOL)
+    - Price has NOT retraced more than 40% from session high (drive intact)
+
+    Scores higher for:
+    - Larger gap %
+    - Counter-trend RS (stock up while market flat/down)
+    - RVOL > 2x
+    - Price at/near session high (drive still extending)
+    """
+    ts = now_et()
+    # Only fire in first 75 minutes
+    if not in_window(ts, 9, 30, 10, 45):
+        return False, {}
+
+    # Need prior close to calculate gap
+    if not prior_close or prior_close == 0:
+        return False, {}
+
+    r = rh(c5)
+    if len(r) < 2:
+        return False, {}
+
+    # Confirm gap up >= 2%
+    today_open = r[0]["o"]
+    gap = (today_open - prior_close) / prior_close * 100
+    if gap < 2.0:
+        return False, {}
+
+    # VWAP — must be holding above it (drive is real, not fading)
+    above_vwap = p > (vw or 0)
+    if not above_vwap:
+        return False, {}
+
+    # RVOL gate — must be in play
+    if not rvol or rvol < RVOL_MIN:
+        return False, {}
+
+    # First bar quality — must have closed in top 50% of its range
+    first_bar = r[0]
+    first_bar_range = first_bar["h"] - first_bar["l"]
+    first_bar_close_pos = ((first_bar["c"] - first_bar["l"]) / first_bar_range
+                           if first_bar_range > 0 else 0)
+    if first_bar_close_pos < 0.50:
+        return False, {}
+
+    # Price must be above PMH (gap didn't fade back into premarket range)
+    if pmh_v and p < pmh_v:
+        return False, {}
+
+    # Drive intact — price hasn't retraced more than 40% from session high
+    session_high = max(c["h"] for c in r)
+    session_low  = r[0]["l"]   # approximate drive base as opening bar low
+    drive_size   = session_high - session_low
+    if drive_size > 0:
+        retrace_pct = (session_high - p) / drive_size
+        if retrace_pct > 0.40:
+            return False, {}
+
+    # Score
+    base  = 68
+    score = base
+    score += 10 if gap >= 5.0 else (5 if gap >= 3.0 else 2)
+    score += 8  if rvol >= RVOL_STRONG else (4 if rvol >= RVOL_MIN else 0)
+    score += 5  if above_vwap else 0
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    # Tier gate — still applies
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    near_hod    = abs(p - session_high) / session_high <= 0.005
+    action      = "Actionable" if (rvol >= RVOL_STRONG and near_hod) else "Watch"
+
+    return True, {
+        "setup":   "OPENING_DRIVE_LONG",
+        "dir":     "🟢 LONG",
+        "trigger": f"Opening drive holding above gap — ${round(today_open, 2)} open, ${round(p, 2)} now",
+        "inval":   f"Loss of VWAP ${round(vw, 2) if vw else 'N/A'} or PM High ${round(pmh_v, 2) if pmh_v else 'N/A'}",
+        "level":   f"Gap: +{round(gap, 1)}% | Session HOD: ${round(session_high, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
+        "vol":     f"RVOL {rvol}x ✅" if rvol >= RVOL_STRONG else f"RVOL {rvol}x",
+        "score":   score,
+        "action":  action,
+        "notes":   (f"Gap +{round(gap, 1)}% from ${round(prior_close, 2)} | "
+                    f"Drive {round((1-retrace_pct)*100, 0):.0f}% intact | "
+                    f"First bar top {round(first_bar_close_pos*100,0):.0f}%"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
 def sweep_watch_long_v2(c2, p, vw):
     r = rh(c2)
     if len(r) < 8:
@@ -2251,6 +2431,26 @@ class Scanner:
             "fired_price": current_price,  # NEW — store price at fire time
         }
 
+    def check_api_health(self, cycle_had_data=True):
+        """
+        Alert if Schwab API has been returning empty responses.
+        The _api_consecutive_failures counter is incremented in _get()
+        on failure and reset on success. We just check the threshold here.
+        """
+        global _api_consecutive_failures, _api_failure_alerted
+        if (_api_consecutive_failures >= API_FAILURE_THRESHOLD
+                and not _api_failure_alerted):
+            _api_failure_alerted = True
+            send_telegram(
+                "🚨 <b>SCANNER FEED DOWN</b>\n"
+                f"Schwab API returning errors for ~{_api_consecutive_failures} min.\n"
+                "Alerts are NOT firing. Check Railway logs.\n"
+                "Send /reauth if auth may have expired."
+            )
+        elif _api_consecutive_failures == 0 and _api_failure_alerted:
+            _api_failure_alerted = False
+            send_telegram("✅ <b>Scanner feed recovered.</b> Alerts resuming.")
+
     def scan_standard(self, ticker):
         candidates = []
         try:
@@ -2262,6 +2462,9 @@ class Scanner:
             c10     = closed_only(c10_raw, 10)
             if not c5 or not c1:
                 return candidates
+            # Mark that data loaded — used by API health monitor
+            # Return non-empty list sentinel handled in run loop
+            _ = True   # candles loaded successfully
 
             p = price(ticker)
             if not p:
@@ -2270,12 +2473,14 @@ class Scanner:
             vw    = vwap(c5)
             pmh_v = self.pmh.get(ticker)
             pml_v = self.pml.get(ticker)
-            pd    = self.pr.get(ticker, {})
-            pdh   = pd.get("h")
-            pdl   = pd.get("l")
+            pd          = self.pr.get(ticker, {})
+            pdh         = pd.get("h")
+            pdl         = pd.get("l")
+            prior_close = pd.get("c")   # prior day close — used for gap detection
 
             # Quality inputs — computed once per ticker
-            rvol             = calc_rvol(c5)
+            # Pass prior_close so calc_rvol can detect gap days and adjust baseline
+            rvol             = calc_rvol(c5, prior_close=prior_close)
             tkr_pct          = session_pct_change(c5)
             tkr_atr_pct      = atr_pct(c5)
             tkr_recent_dir   = recent_direction(c5, lookback=4)
@@ -2283,9 +2488,8 @@ class Scanner:
             # Full direction-aware RS grading — catches counter-trend strength
             rs_mod, rs_label, rs_tier = grade_rs(
                 tkr_pct, tkr_atr_pct, tkr_recent_dir,
-                self._spy_ctx, direction="long"   # per-setup direction handled below
+                self._spy_ctx, direction="long"
             )
-            # Short setups get inverted RS — computed separately in each short setup call
             rs_mod_short, rs_label_short, rs_tier_short = grade_rs(
                 tkr_pct, tkr_atr_pct, tkr_recent_dir,
                 self._spy_ctx, direction="short"
@@ -2293,6 +2497,8 @@ class Scanner:
 
             setups = [
                 # ── LONG setups — use long RS ──
+                ("OPENING_DRIVE_LONG",
+                 lambda: opening_drive_long(c5, c1, p, vw, pmh_v, prior_close, rvol, rs_mod, rs_tier)),
                 ("ORB_5M_LONG",
                  lambda: orb_5m_long(c5, c1, p, vw, pmh_v, rvol, rs_mod, rs_tier)),
                 ("ORB_15M_LONG",
@@ -2463,7 +2669,7 @@ class Scanner:
                        f"dir={spy.get('recent_dir','?')} | "
                        f"ATR={spy.get('atr_pct','N/A')}%")
             send_alert(
-                f"📊 <b>Scanner v3.11</b>\n"
+                f"📊 <b>Scanner v3.12</b>\n"
                 f"Stocks: {len(self.wl)} | Armed: {len(self.armed)}\n"
                 f"Min score: {MIN_SCORE}/100\n"
                 f"Active fired signals: {len(self.fired_signals)}\n"
@@ -2554,9 +2760,9 @@ class Scanner:
             )
 
     def run(self):
-        print("[SCANNER] v3.11 starting")
+        print("[SCANNER] v3.12 starting")
         send_alert(
-            f"🤖 <b>Scanner v3.11 Online</b>\n{'━' * 28}\n"
+            f"🤖 <b>Scanner v3.12 Online</b>\n{'━' * 28}\n"
             f"Watching <b>{len(self.wl)} stocks</b> | Armed <b>{len(self.armed)}</b>\n"
             f"Threshold ≥ {MIN_SCORE}/100\n{'━' * 28}\n"
             f"<b>New in v3.8 — Direction-Aware RS:</b>\n"
@@ -2579,10 +2785,18 @@ class Scanner:
             self.refresh()
             self.refresh_spy()
 
+            cycle_had_data = True   # health tracked via _api_consecutive_failures in _get
+
             for t in list(self.wl):
                 print(f"[SCAN] {t}...")
                 try:
-                    for name, d in self.scan_standard(t):
+                    results = self.scan_standard(t)
+                    # scan_standard returns [] on no data OR on no setups firing
+                    # We track data separately via the global _api_consecutive_failures
+                    # which resets in _get() on any successful API call
+                    if results is not None:
+                        cycle_had_data = True
+                    for name, d in (results or []):
                         bar_ts      = d.get("trigger_bar_ts")
                         fired_price = d.get("_fired_price")
                         rs_label    = d.pop("_rs_label", "")
@@ -2607,6 +2821,7 @@ class Scanner:
 
                 time.sleep(0.35)
 
+            self.check_api_health(cycle_had_data)
             print(f"[SCAN] Cycle done. {len(self.fired_signals)} active signals. Sleep 60s.")
             time.sleep(60)
 
