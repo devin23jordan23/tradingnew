@@ -1,5 +1,5 @@
 """
-main.py — Andre's Trading Scanner v3.10
+main.py — Andre's Trading Scanner v3.11
 
 CHANGES FROM v3.6
 ─────────────────────────────────────────────────────────────────
@@ -183,9 +183,13 @@ FIB_MIN_BARS   = 3
 
 # EMA direction context — bars price must have spent on correct side
 # before a touch is considered a valid pullback (not a resistance test)
-EMA_PRIOR_BARS_5M  = 3   # at least 3 bars above EMA before touch (5-min)
-EMA_PRIOR_BARS_10M = 5   # at least 5 bars above EMA before touch (10-min)
-EMA_MAX_CROSS_BARS = 2   # allow at most this many bars on wrong side in window
+# TIGHTENED: EMA_MAX_CROSS_BARS reduced from 2 to 0 — zero tolerance.
+# If price spent ANY bar on the wrong side of the EMA in the check window,
+# it is NOT a clean trend pullback. It is a chop zone or a resistance test.
+# This is the core fix for "long alerts when price is approaching from below."
+EMA_PRIOR_BARS_5M  = 4   # need 4 consecutive bars above EMA before touch (5-min)
+EMA_PRIOR_BARS_10M = 5   # need 5 bars above EMA before touch (10-min)
+EMA_MAX_CROSS_BARS = 0   # ZERO cross bars allowed — clean side only
 
 # Volume baseline window — use first N session bars as reference pace
 VOL_BASELINE_BARS = 8    # first 8 bars = first 40 min of session on 5-min chart
@@ -830,30 +834,25 @@ def grade_rs(ticker_pct, ticker_atr_pct, ticker_recent_dir, spy_ctx, direction="
 
 def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROSS_BARS):
     """
-    Classify whether price approached the EMA from ABOVE or BELOW,
-    and whether the approach is valid for a pullback setup.
+    Classify whether price approached the EMA from ABOVE or BELOW.
 
-    For a LONG pullback to be valid:
-    - Price must have been ABOVE the EMA for at least prior_bars_required
-      of the last (prior_bars_required + max_cross_bars) bars
-    - The recent touch/cross should be the first (or at most second)
-      bar breaking the EMA from above
+    TIGHTENED in v3.11:
+    - Looks back 8 bars total (was prior_bars + max_cross which was only 4-5)
+    - Zero cross tolerance (EMA_MAX_CROSS_BARS = 0) — any bar on the wrong
+      side in the 8-bar window = MIXED, not a clean pullback
+    - This directly kills the "approaching from below" false long alerts
+      because any bar below EMA in the window returns "mixed" which blocks
+      the long setup entirely
 
-    Returns:
-      "from_above"  — valid for long pullback setup
-      "from_below"  — price was below EMA, touch is resistance test
-      "mixed"       — too many crosses, choppy — not actionable
-      "insufficient_data" — not enough bars
-
-    Also returns bars_above, bars_below counts for the notes.
+    The VWAP hard gate in each setup function is the primary blocker.
+    This is the secondary/confirmation filter.
     """
-    window = prior_bars_required + max_cross_bars
-    if len(r) < window + 1 or len(es) < window + 1:
+    LOOKBACK = 8   # always look back 8 bars regardless of prior_bars_required
+    if len(r) < LOOKBACK + 1 or len(es) < LOOKBACK + 1:
         return "insufficient_data", 0, 0
 
-    # Look at the bars BEFORE the most recent one (the setup bars)
-    check_bars = r[-(window + 1):-1]
-    check_emas = es[-(window + 1):-1]
+    check_bars = r[-(LOOKBACK + 1):-1]
+    check_emas = es[-(LOOKBACK + 1):-1]
 
     above_count = 0
     below_count = 0
@@ -869,9 +868,10 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     if total == 0:
         return "insufficient_data", 0, 0
 
-    if above_count >= prior_bars_required and below_count <= max_cross_bars:
+    # Zero cross tolerance — any bar on wrong side = mixed
+    if above_count >= prior_bars_required and below_count == 0:
         return "from_above", above_count, below_count
-    elif below_count >= prior_bars_required and above_count <= max_cross_bars:
+    elif below_count >= prior_bars_required and above_count == 0:
         return "from_below", above_count, below_count
     else:
         return "mixed", above_count, below_count
@@ -2194,28 +2194,61 @@ class Scanner:
             print(f"[SPY ERR] {e}")
             self._spy_ctx = {"session_pct": None, "atr_pct": None, "recent_dir": "flat"}
 
-    def should_fire(self, ticker, setup, bar_ts):
+    def should_fire(self, ticker, setup, bar_ts, current_price=None):
         """
-        FIX: trigger_bar_ts None guard.
-        If bar_ts is None (setup couldn't determine bar), skip bar comparison
-        and fall through to time-gap check only.
+        Three-layer dedup — any one layer blocking = no fire.
+
+        LAYER 1 — Per-bar dedup (unchanged):
+          Same bar timestamp as last fire = absolute block.
+          One alert per bar, always.
+
+        LAYER 2 — Time gap (raised to 30 min):
+          Even on a new bar, must wait 30 minutes since last fire
+          of this setup on this ticker.
+
+        LAYER 3 — Price-level dedup (NEW — the stale alert fix):
+          If price hasn't moved meaningfully since the last fire,
+          the setup hasn't reset — it's the same stale condition
+          re-evaluating. Gate: price must have moved at least 0.15%
+          from the level at which the signal last fired.
+          This kills the "ranging stock firing EMA alerts every 5 min"
+          problem because price keeps coming back to the same level.
+          A real new setup requires price to have moved away and come back.
         """
         key  = (ticker, setup)
         info = self.fired_signals.get(key)
         if info is None:
             return True
-        stored_bar_ts = info.get("bar_ts")
-        # Only do bar comparison when BOTH sides are non-None
+
+        stored_bar_ts   = info.get("bar_ts")
+        stored_price    = info.get("fired_price")
+        fired_at        = info.get("fired_at")
+
+        # LAYER 1 — same bar = block
         if bar_ts is not None and stored_bar_ts is not None and bar_ts == stored_bar_ts:
             return False
-        gap_min = (now_et() - info["fired_at"]).total_seconds() / 60
-        return gap_min >= MIN_REFIRE_GAP_MIN
 
-    def mark_fired(self, ticker, setup, bar_ts, score):
+        # LAYER 2 — time gap
+        if fired_at:
+            gap_min = (now_et() - fired_at).total_seconds() / 60
+            if gap_min < MIN_REFIRE_GAP_MIN:
+                return False
+
+        # LAYER 3 — price must have moved meaningfully since last fire
+        if current_price and stored_price and stored_price > 0:
+            price_move_pct = abs(current_price - stored_price) / stored_price * 100
+            if price_move_pct < 0.15:
+                # Price has barely moved — this is the same stale condition
+                return False
+
+        return True
+
+    def mark_fired(self, ticker, setup, bar_ts, score, current_price=None):
         self.fired_signals[(ticker, setup)] = {
-            "fired_at": now_et(),
-            "bar_ts":   bar_ts,
-            "score":    score,
+            "fired_at":    now_et(),
+            "bar_ts":      bar_ts,
+            "score":       score,
+            "fired_price": current_price,  # NEW — store price at fire time
         }
 
     def scan_standard(self, ticker):
@@ -2308,17 +2341,17 @@ class Scanner:
                     if d.get("score", 0) < MIN_SCORE:
                         continue
                     bar_ts = d.get("trigger_bar_ts")
-                    if not self.should_fire(ticker, name, bar_ts):
+                    if not self.should_fire(ticker, name, bar_ts, current_price=p):
                         continue
                     # Tag correct RS label based on direction
                     is_short   = "SHORT" in name
                     alert_tier = rs_tier_short if is_short else rs_tier
                     # HARD GATE: suppress C and D tier alerts entirely
-                    # You only want B and better. C/D = low RS, not your edge.
                     if alert_tier in ("C", "D"):
                         continue
-                    d["_rs_label"] = rs_label_short if is_short else rs_label
-                    d["_rs_tier"]  = alert_tier
+                    d["_rs_label"]    = rs_label_short if is_short else rs_label
+                    d["_rs_tier"]     = alert_tier
+                    d["_fired_price"] = p   # stored for price-level dedup in mark_fired
                     candidates.append((name, d))
                 except Exception as e:
                     print(f"[SETUP ERR] {ticker}:{name}:{e}")
@@ -2355,7 +2388,7 @@ class Scanner:
                     if not ok:
                         continue
                     bar_ts = d.get("trigger_bar_ts")
-                    if not self.should_fire(ticker, name, bar_ts):
+                    if not self.should_fire(ticker, name, bar_ts, current_price=p):
                         continue
                     candidates.append((name, d))
                 except Exception as e:
@@ -2430,7 +2463,7 @@ class Scanner:
                        f"dir={spy.get('recent_dir','?')} | "
                        f"ATR={spy.get('atr_pct','N/A')}%")
             send_alert(
-                f"📊 <b>Scanner v3.10</b>\n"
+                f"📊 <b>Scanner v3.11</b>\n"
                 f"Stocks: {len(self.wl)} | Armed: {len(self.armed)}\n"
                 f"Min score: {MIN_SCORE}/100\n"
                 f"Active fired signals: {len(self.fired_signals)}\n"
@@ -2521,9 +2554,9 @@ class Scanner:
             )
 
     def run(self):
-        print("[SCANNER] v3.10 starting")
+        print("[SCANNER] v3.11 starting")
         send_alert(
-            f"🤖 <b>Scanner v3.10 Online</b>\n{'━' * 28}\n"
+            f"🤖 <b>Scanner v3.11 Online</b>\n{'━' * 28}\n"
             f"Watching <b>{len(self.wl)} stocks</b> | Armed <b>{len(self.armed)}</b>\n"
             f"Threshold ≥ {MIN_SCORE}/100\n{'━' * 28}\n"
             f"<b>New in v3.8 — Direction-Aware RS:</b>\n"
@@ -2550,20 +2583,24 @@ class Scanner:
                 print(f"[SCAN] {t}...")
                 try:
                     for name, d in self.scan_standard(t):
-                        bar_ts   = d.get("trigger_bar_ts")
-                        rs_label = d.pop("_rs_label", "")
-                        rs_tier  = d.pop("_rs_tier",  "?")
+                        bar_ts      = d.get("trigger_bar_ts")
+                        fired_price = d.get("_fired_price")
+                        rs_label    = d.pop("_rs_label", "")
+                        rs_tier     = d.pop("_rs_tier",  "?")
+                        d.pop("_fired_price", None)
                         send_alert(fmt(t, d, rs_label, rs_tier))
-                        self.mark_fired(t, name, bar_ts, d.get("score", 0))
+                        self.mark_fired(t, name, bar_ts, d.get("score", 0), current_price=fired_price)
                         time.sleep(1)
                 except Exception as e:
                     print(f"[STD LOOP ERR] {t}:{e}")
 
                 try:
                     for name, d in self.scan_sweep(t):
-                        bar_ts = d.get("trigger_bar_ts")
+                        bar_ts      = d.get("trigger_bar_ts")
+                        fired_price = d.get("_fired_price")
+                        d.pop("_fired_price", None)
                         send_alert(fmt(t, d))
-                        self.mark_fired(t, name, bar_ts, d.get("score", 0))
+                        self.mark_fired(t, name, bar_ts, d.get("score", 0), current_price=fired_price)
                         time.sleep(1)
                 except Exception as e:
                     print(f"[SWEEP LOOP ERR] {t}:{e}")
