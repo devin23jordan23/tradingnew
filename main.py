@@ -1,5 +1,5 @@
 """
-main.py — Andre's Trading Scanner v3.12
+main.py — Andre's Trading Scanner v3.15
 
 CHANGES FROM v3.6
 ─────────────────────────────────────────────────────────────────
@@ -162,9 +162,14 @@ SIGNAL_TTL = {
     "PDH_BREAK_RETEST_LONG":    30,
     "PDL_BREAK_RETEST_SHORT":   30,
     "LATER_DAY_HOD_BREAKOUT":   25,
-    "OPENING_DRIVE_LONG":       30,   # fires early, stays valid through first hour
+    "OPENING_DRIVE_LONG":       30,
     "FIB_PULLBACK_LONG":        20,
     "FIB_PULLBACK_SHORT":       20,
+    "FASHIONABLY_LATE_LONG":    20,
+    "FASHIONABLY_LATE_SHORT":   20,
+    "RUBBER_BAND_SCALP_LONG":   15,   # momentum snapback — act fast or miss it
+    "SECOND_CHANCE_SCALP_LONG": 20,   # retest valid for ~20 min before level goes stale
+    "HITCHHIKER_SCALP_LONG":    10,   # opening drive only, tight window
     "SWEEP_WATCH":              10,
     "SWEEP_ACTIVE":              5,
     "SWEEP_RECLAIM_LONG":       15,
@@ -903,7 +908,7 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     """
     Classify whether price approached the EMA from ABOVE or BELOW.
 
-    TIGHTENED in v3.12:
+    TIGHTENED in v3.15:
     - Looks back 8 bars total (was prior_bars + max_cross which was only 4-5)
     - Zero cross tolerance (EMA_MAX_CROSS_BARS = 0) — any bar on the wrong
       side in the 8-bar window = MIXED, not a clean pullback
@@ -2098,6 +2103,827 @@ def opening_drive_long(c5, c1, p, vw, pmh_v, prior_close, rvol, rs_mod, rs_tier=
     }
 
 
+# ──────────────────────────────────────────────────────────────
+# FASHIONABLY LATE — SMB Rubber Band VWAP/EMA Cross Model
+# ──────────────────────────────────────────────────────────────
+
+def _measure_ema_vwap_divergence(r, es, vw_series, direction="long"):
+    """
+    Scan backwards through bars to identify the divergence and
+    convergence phases of the Fashionably Late model.
+
+    Returns a dict with:
+      impulse_start_idx  — bar where EMA/VWAP separation began
+      exhaustion_idx     — bar of swing high (long) or swing low (short)
+      divergence_bars    — number of bars in divergence phase
+      convergence_bars   — number of bars in convergence phase (up to current)
+      max_separation     — peak |EMA - VWAP| seen during divergence
+      exhaustion_price   — price at exhaustion point (for stop calc)
+      vol_div_avg        — avg volume during divergence phase
+      vol_conv_avg       — avg volume during convergence phase
+    Returns None if phases can't be cleanly identified.
+    """
+    if len(r) < 8 or len(es) < 8 or not vw_series:
+        return None
+
+    # Build parallel VWAP series aligned with r
+    # vw_series is a list of cumulative VWAP values per bar
+    n = min(len(r), len(es), len(vw_series))
+    if n < 8:
+        return None
+
+    # Find the exhaustion point — swing high for longs, swing low for shorts
+    # Look back max 20 bars
+    lookback = min(n - 1, 20)
+    window = r[n - lookback:n]
+    window_es = es[n - lookback:n]
+    window_vw = vw_series[n - lookback:n]
+
+    if direction == "long":
+        # Swing high = highest bar before the current reversal
+        # Find bar with max high in the first 2/3 of the window
+        search_end = max(3, len(window) * 2 // 3)
+        exh_idx_local = max(range(search_end), key=lambda i: window[i]["h"])
+    else:
+        search_end = max(3, len(window) * 2 // 3)
+        exh_idx_local = min(range(search_end), key=lambda i: window[i]["l"])
+
+    exh_bar   = window[exh_idx_local]
+    exh_price = exh_bar["h"] if direction == "long" else exh_bar["l"]
+    exh_ema   = window_es[exh_idx_local]
+    exh_vwap  = window_vw[exh_idx_local]
+    if exh_ema is None or exh_vwap is None:
+        return None
+
+    max_sep = abs(exh_ema - exh_vwap)
+    # RAISED from 0.001 to 0.008 — rubber band must be genuinely stretched.
+    # Looking at the SMB charts the EMA/VWAP separation at exhaustion is
+    # clearly 1-3% of price. 0.001 (0.1%) was so small it allowed flat
+    # markets where EMA and VWAP naturally drift apart by noise.
+    # 0.008 = 0.8% minimum — on a $180 stock that's $1.44 separation.
+    if max_sep / (exh_vwap or 1) < 0.008:
+        return None   # not a real rubber band stretch
+
+    # Divergence phase: bars from impulse start up to exhaustion
+    div_bars  = window[:exh_idx_local + 1]
+    conv_bars = window[exh_idx_local + 1:]
+
+    divergence_bars  = len(div_bars)
+    convergence_bars = len(conv_bars)
+
+    if divergence_bars < 2 or convergence_bars < 1:
+        return None
+
+    vol_div_avg  = sum(c["v"] for c in div_bars)  / len(div_bars)
+    vol_conv_avg = sum(c["v"] for c in conv_bars) / len(conv_bars) if conv_bars else 0
+
+    return {
+        "exhaustion_price":  exh_price,
+        "max_separation":    max_sep,
+        "divergence_bars":   divergence_bars,
+        "convergence_bars":  convergence_bars,
+        "vol_div_avg":       vol_div_avg,
+        "vol_conv_avg":      vol_conv_avg,
+        "exh_ema":           exh_ema,
+        "exh_vwap":          exh_vwap,
+    }
+
+
+def _rolling_vwap_series(cs):
+    """
+    Build a per-bar cumulative VWAP value series aligned with rh(cs).
+    Returns list of VWAP values, one per regular-hours bar.
+    """
+    r = rh(cs)
+    out = []
+    total_val = total_vol = 0
+    for c in r:
+        tp = (c["h"] + c["l"] + c["c"]) / 3
+        total_val += tp * c["v"]
+        total_vol += c["v"]
+        out.append(total_val / total_vol if total_vol else None)
+    return out
+
+
+def fashionably_late_long(c5, p, vw, rvol, rs_mod, rs_tier="?", spy_ctx=None):
+    """
+    Fashionably Late — Long Version (SMB Rubber Band VWAP/EMA Cross Model)
+
+    Phase model:
+    1. IMPULSE: price drives up, EMA and VWAP diverge (EMA > VWAP)
+    2. EXHAUSTION: swing high forms, momentum slows
+    3. CONVERGENCE: price pulls back toward VWAP, EMA curls back
+    4. CROSS TRIGGER: EMA crosses back above VWAP from below, or
+       price reclaims VWAP with EMA supporting from below
+
+    Entry = the cross bar or immediate retest hold.
+    Stop = exhaustion_high + (cross_price - exhaustion_high) / 3
+           (1/3 of way from exhaustion to cross, from the top)
+
+    Hard invalids from the model:
+    - Convergence > 15 min (price lingered too long near VWAP)
+    - EMA choppily crossing VWAP multiple times (no clean separation)
+    - Market conflict (SPY trend opposing)
+    - Convergence volume < divergence volume (distribution, not reset)
+    """
+    r = rh(c5)
+    if len(r) < 12:
+        return False, {}
+
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    if en is None or not vw:
+        return False, {}
+
+    # Build rolling VWAP series
+    vw_series = _rolling_vwap_series(c5)
+    if len(vw_series) < 12:
+        return False, {}
+
+    # ── TRIGGER: EMA must be crossing above or just crossed above VWAP ──
+    # Last bar: EMA crosses above VWAP
+    # Previous bar: EMA was below VWAP (or very close — within 0.1%)
+    prev_ema  = es[-2]  if len(es)  >= 2 else None
+    prev_vwap = vw_series[-2] if len(vw_series) >= 2 else None
+    curr_vwap = vw_series[-1] if vw_series else None
+
+    if prev_ema is None or prev_vwap is None or curr_vwap is None:
+        return False, {}
+
+    # ── TRIGGER — three valid entry conditions ──
+    # Per the SMB image: "enter in direction of 9 EMA slope as it GETS READY
+    # to cross." This means we fire BEFORE or AT the cross, not only after.
+    #
+    # Condition A — EMA approaching: within 0.3% of VWAP, still below, converging fast
+    ema_approaching = (
+        en < curr_vwap and
+        en >= curr_vwap * 0.997 and           # within 0.3% below VWAP
+        prev_ema < en and                      # EMA still rising toward VWAP
+        (curr_vwap - en) < (prev_vwap - prev_ema)  # gap is narrowing
+    )
+    # Condition B — EMA just crossed above VWAP this bar
+    ema_just_crossed = (en >= curr_vwap * 0.9995) and (prev_ema < prev_vwap * 1.001)
+    # Condition C — EMA crossed last bar, price holding above VWAP (retest hold)
+    ema_retest_hold  = (en > curr_vwap) and (prev_ema >= prev_vwap * 0.9995) and (p > curr_vwap)
+
+    if not (ema_approaching or ema_just_crossed or ema_retest_hold):
+        return False, {}
+
+    # ── EMA must be sloping UP (not flat or curling down) ──
+    ema_vals = [e for e in es[-5:] if e is not None]
+    ema_rising = len(ema_vals) >= 3 and ema_vals[-1] > ema_vals[-3]
+    if not ema_rising:
+        return False, {}
+
+    # ── Price must be at or near VWAP (approaching from below or just crossed) ──
+    if p < vw * 0.996:   # allow slightly below for approaching condition
+        return False, {}
+
+    # ── PHASE VALIDATION: measure divergence and convergence ──
+    phases = _measure_ema_vwap_divergence(r, es, vw_series, direction="long")
+    if not phases:
+        return False, {}
+
+    div_bars  = phases["divergence_bars"]
+    conv_bars = phases["convergence_bars"]
+    vol_div   = phases["vol_div_avg"]
+    vol_conv  = phases["vol_conv_avg"]
+    exh_price = phases["exhaustion_price"]
+    max_sep   = phases["max_separation"]
+
+    # HARD FILTER 1: convergence must be < 15 min (3 bars on 5-min)
+    CONV_MAX_BARS = 3
+    if conv_bars > CONV_MAX_BARS:
+        return False, {}
+
+    # HARD FILTER 2: convergence must be faster than divergence (< 2/3 time)
+    if conv_bars >= div_bars * 0.67:
+        return False, {}
+
+    # HARD FILTER 3: convergence volume must exceed divergence volume
+    if vol_conv and vol_div and vol_conv < vol_div * 0.9:
+        return False, {}
+
+    # HARD FILTER 4: meaningful separation — 0.8% minimum of price
+    # Per SMB charts the rubber band must be genuinely stretched.
+    # 0.1% was too small — looked at charts, separation is clearly 1-3%.
+    if max_sep / (p or 1) < 0.008:
+        return False, {}
+
+    # HARD FILTER 5: market conflict check
+    if spy_ctx:
+        spy_dir = spy_ctx.get("recent_dir", "flat")
+        if spy_dir == "down":
+            return False, {}
+
+    # HARD FILTER 6: NO SIGNIFICANT PAUSE between convergence and cross
+    # Per SMB image 7: "significant pause after convergence but before the cross"
+    # = INVALID. Detect by checking if the last conv_bars had overlapping,
+    # low-range candles (chop) before reaching the trigger.
+    if conv_bars >= 2:
+        conv_window = r[-(conv_bars + 1):-1]
+        if len(conv_window) >= 2:
+            ranges = [c["h"] - c["l"] for c in conv_window]
+            avg_range = sum(ranges) / len(ranges) if ranges else 0
+            atr_val   = atr(c5) or 1
+            # Pause detected: avg range < 25% of ATR = overlapping/flat candles
+            if avg_range > 0 and avg_range < atr_val * 0.25:
+                return False, {}
+
+    # ── CROSS BAR QUALITY ──
+    cross_bar = r[-1]
+    bar_range = cross_bar["h"] - cross_bar["l"]
+    close_pos = (cross_bar["c"] - cross_bar["l"]) / bar_range if bar_range > 0 else 0
+    if close_pos < 0.40:
+        return False, {}
+
+    # ── STOP & TARGET CALCULATION (per official SMB PDF) ──
+    # PDF says: "Hard stop 1/3 the distance from VWAP to the Low of the day"
+    # Stop  = cross_price - (cross_price - lod) / 3
+    # Target = cross_price + (cross_price - lod)  [1 measured move above cross]
+    # where measured move = distance from LOD to cross point
+    cross_price = p
+    lod         = min(c["l"] for c in r) if r else cross_price
+    measured    = cross_price - lod if cross_price > lod else 0
+    stop_price  = round(cross_price - measured / 3, 2) if measured > 0 else None
+    tgt_price   = round(cross_price + measured, 2)     if measured > 0 else None
+    stop_str    = (f"${stop_price} (1/3 of LOD→cross distance below entry)"
+                  if stop_price else "Below LOD")
+    tgt_str     = f"${tgt_price} (measured move above cross)" if tgt_price else "N/A"
+
+    # Status label — approaching vs confirmed
+    status = "Cross imminent ⚡" if ema_approaching else "Cross confirmed ✅"
+
+    # ── SCORE ──
+    base  = 70   # higher base — this is a structured institutional model
+    score = base
+    score += 10 if vol_conv > vol_div * 1.2 else (5 if vol_conv >= vol_div * 0.9 else 0)
+    score += 8  if rvol and rvol >= RVOL_STRONG else (3 if rvol and rvol >= RVOL_MIN else -5)
+    score += 5  if close_pos >= 0.60 else 0   # strong close on cross bar
+    score += 5  if conv_bars <= 2 else 0       # fast convergence = more energy
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    # Tier gate
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    return True, {
+        "setup":   "FASHIONABLY_LATE_LONG",
+        "dir":     "🟢 LONG",
+        "trigger": f"{status} — EMA9 {'approaching' if ema_approaching else 'crossed above'} VWAP ${round(curr_vwap, 2)}",
+        "inval":   stop_str,
+        "level":   (f"VWAP: ${round(curr_vwap, 2)} | EMA9: ${round(en, 2)} | "
+                    f"LOD: ${round(lod, 2)} | Target: {tgt_str}"),
+        "vol":     (f"Conv {round(vol_conv/vol_div, 1)}x div volume ✅ RVOL {rvol}x"
+                    if vol_div > 0 else f"RVOL {rvol}x"),
+        "score":   score,
+        "action":  "Actionable" if score >= 75 else "Watch",
+        "notes":   (f"Fashionably Late | Div {div_bars}b → Conv {conv_bars}b | "
+                    f"EMA/VWAP sep: ${round(max_sep, 2)} | "
+                    f"Measured move: ${round(measured, 2)} | "
+                    f"Cross bar: top {round(close_pos*100,0):.0f}%"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def fashionably_late_short(c5, p, vw, rvol, rs_mod, rs_tier="?", spy_ctx=None):
+    """
+    Fashionably Late — Short Version.
+
+    Phase model:
+    1. IMPULSE: price drives DOWN, EMA and VWAP diverge (EMA < VWAP)
+    2. EXHAUSTION: swing low forms
+    3. CONVERGENCE: price bounces toward VWAP, EMA curls back up toward VWAP
+    4. CROSS TRIGGER: EMA crosses below VWAP from above (confirmation of trend resumption)
+
+    Stop = exhaustion_low - (exhaustion_low - cross_price) / 3
+    """
+    r = rh(c5)
+    if len(r) < 12:
+        return False, {}
+
+    cls = [c["c"] for c in r]
+    es  = ema_series(cls, 9)
+    en  = es[-1]
+    if en is None or not vw:
+        return False, {}
+
+    vw_series = _rolling_vwap_series(c5)
+    if len(vw_series) < 12:
+        return False, {}
+
+    prev_ema  = es[-2]  if len(es)  >= 2 else None
+    prev_vwap = vw_series[-2] if len(vw_series) >= 2 else None
+    curr_vwap = vw_series[-1] if vw_series else None
+
+    if prev_ema is None or prev_vwap is None or curr_vwap is None:
+        return False, {}
+
+    # ── TRIGGER — approaching or crossing below VWAP ──
+    # Condition A — EMA approaching from above: within 0.3% of VWAP, still above
+    ema_approaching = (
+        en > curr_vwap and
+        en <= curr_vwap * 1.003 and
+        prev_ema > en and
+        (en - curr_vwap) < (prev_ema - prev_vwap)
+    )
+    # Condition B — EMA just crossed below VWAP this bar
+    ema_just_crossed = (en <= curr_vwap * 1.0005) and (prev_ema > prev_vwap * 0.999)
+    # Condition C — retest hold below VWAP
+    ema_retest_hold  = (en < curr_vwap) and (prev_ema <= prev_vwap * 1.0005) and (p < curr_vwap)
+
+    if not (ema_approaching or ema_just_crossed or ema_retest_hold):
+        return False, {}
+
+    ema_vals   = [e for e in es[-5:] if e is not None]
+    ema_falling = len(ema_vals) >= 3 and ema_vals[-1] < ema_vals[-3]
+    if not ema_falling:
+        return False, {}
+
+    if p > vw * 1.004:
+        return False, {}
+
+    phases = _measure_ema_vwap_divergence(r, es, vw_series, direction="short")
+    if not phases:
+        return False, {}
+
+    div_bars  = phases["divergence_bars"]
+    conv_bars = phases["convergence_bars"]
+    vol_div   = phases["vol_div_avg"]
+    vol_conv  = phases["vol_conv_avg"]
+    exh_price = phases["exhaustion_price"]
+    max_sep   = phases["max_separation"]
+
+    CONV_MAX_BARS = 3
+    if conv_bars > CONV_MAX_BARS:
+        return False, {}
+    if conv_bars >= div_bars * 0.67:
+        return False, {}
+    if vol_conv and vol_div and vol_conv < vol_div * 0.9:
+        return False, {}
+    # Raised from 0.001 to 0.008 — genuine rubber band stretch required
+    if max_sep / (p or 1) < 0.008:
+        return False, {}
+
+    if spy_ctx:
+        spy_dir = spy_ctx.get("recent_dir", "flat")
+        if spy_dir == "up":
+            return False, {}
+
+    # Significant pause invalidation — chop before cross = invalid
+    if conv_bars >= 2:
+        conv_window = r[-(conv_bars + 1):-1]
+        if len(conv_window) >= 2:
+            ranges  = [c["h"] - c["l"] for c in conv_window]
+            avg_rng = sum(ranges) / len(ranges) if ranges else 0
+            atr_val = atr(c5) or 1
+            if avg_rng > 0 and avg_rng < atr_val * 0.25:
+                return False, {}
+
+    cross_bar = r[-1]
+    bar_range = cross_bar["h"] - cross_bar["l"]
+    close_pos = (cross_bar["c"] - cross_bar["l"]) / bar_range if bar_range > 0 else 1
+    if close_pos > 0.60:
+        return False, {}
+
+    # ── STOP & TARGET (per PDF for short: 1/3 from HOD to cross) ──
+    cross_price = p
+    hod         = max(c["h"] for c in r) if r else cross_price
+    measured    = hod - cross_price if hod > cross_price else 0
+    stop_price  = round(cross_price + measured / 3, 2) if measured > 0 else None
+    tgt_price   = round(cross_price - measured, 2)     if measured > 0 else None
+    stop_str    = (f"${stop_price} (1/3 of HOD→cross distance above entry)"
+                  if stop_price else "Above HOD")
+    tgt_str     = f"${tgt_price} (measured move below cross)" if tgt_price else "N/A"
+    status      = "Cross imminent ⚡" if ema_approaching else "Cross confirmed ✅"
+
+    base  = 70
+    score = base
+    score += 10 if vol_conv > vol_div * 1.2 else (5 if vol_conv >= vol_div * 0.9 else 0)
+    score += 8  if rvol and rvol >= RVOL_STRONG else (3 if rvol and rvol >= RVOL_MIN else -5)
+    score += 5  if close_pos <= 0.40 else 0
+    score += 5  if conv_bars <= 2 else 0
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    return True, {
+        "setup":   "FASHIONABLY_LATE_SHORT",
+        "dir":     "🔴 SHORT",
+        "trigger": f"{status} — EMA9 {'approaching' if ema_approaching else 'crossed below'} VWAP ${round(curr_vwap, 2)}",
+        "inval":   stop_str,
+        "level":   (f"VWAP: ${round(curr_vwap, 2)} | EMA9: ${round(en, 2)} | "
+                    f"HOD: ${round(hod, 2)} | Target: {tgt_str}"),
+        "vol":     (f"Conv {round(vol_conv/vol_div, 1)}x div volume ✅ RVOL {rvol}x"
+                    if vol_div > 0 else f"RVOL {rvol}x"),
+        "score":   score,
+        "action":  "Actionable" if score >= 75 else "Watch",
+        "notes":   (f"Fashionably Late | Div {div_bars}b → Conv {conv_bars}b | "
+                    f"EMA/VWAP sep: ${round(max_sep, 2)} | "
+                    f"Measured: ${round(measured, 2)} | "
+                    f"Cross bar: bot {round((1-close_pos)*100,0):.0f}%"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def rubber_band_scalp_long(c5, c1, p, vw, rvol, rs_mod, rs_tier="?", spy_ctx=None):
+    """
+    Rubber Band Scalp — Long (SMB)
+
+    Context: In-play stock grinds down in a controlled way, then selling
+    ACCELERATES (urgent, sloppy). Once the sloppy sell program exhausts,
+    a single green candle clears the highs of 2+ preceding red candles
+    (the "double bar break") — that is the snapback entry.
+
+    Key insight from PDF: it's NOT the extension that makes this work,
+    it's the SLOPPINESS of the acceleration. We're fading urgency, not trend.
+
+    Hard gates:
+    - Price must be down > 3 ATRs from open (real extension)
+    - RVOL > 5x (genuinely in-play)
+    - Last 3 bars: increasing range AND increasing volume (acceleration)
+    - Snapback bar: single green candle clearing highs of 2+ red bars
+    - Snapback bar must be one of the 5 highest volume bars of the day
+    - Market (SPY) must NOT be cleanly trending down (don't fade a trend)
+    - Time: 10:00–13:30 ET (or open if already extended on higher TF)
+    """
+    ts = now_et()
+    # Time gate: 10:00–13:30. Allow open only if extended (handled via ATR check)
+    if not in_window(ts, 10, 0, 13, 30):
+        # Allow 9:30–10:00 only if price is already extended > 4 ATRs
+        if not in_window(ts, 9, 30, 10, 0):
+            return False, {}
+        # Will verify extension below
+
+    r = rh(c5)
+    if len(r) < 8:
+        return False, {}
+
+    # RVOL gate — must be genuinely in-play (> 5x for ideal, > 3x to fire)
+    if not rvol or rvol < 3.0:
+        return False, {}
+
+    atr_val = atr(c5)
+    if not atr_val or atr_val == 0:
+        return False, {}
+
+    # Extension: price must be down > 3 ATRs from open
+    open_price = r[0]["o"]
+    extension  = (open_price - p) / atr_val
+    if extension < 3.0:
+        return False, {}
+
+    # Market conflict: don't fade a cleanly trending down market
+    if spy_ctx:
+        spy_dir = spy_ctx.get("recent_dir", "flat")
+        if spy_dir == "down":
+            return False, {}
+
+    # ── ACCELERATION DETECTION ──
+    # Last 3 bars must show INCREASING range AND INCREASING volume
+    # This is the "sloppy sell program" signature
+    if len(r) < 4:
+        return False, {}
+    last3 = r[-4:-1]   # three bars before the snapback
+    if len(last3) < 3:
+        return False, {}
+    ranges  = [c["h"] - c["l"] for c in last3]
+    volumes = [c["v"] for c in last3]
+    # Range and volume must be increasing across these bars
+    range_accelerating  = ranges[-1]  > ranges[0]  and ranges[-1]  > ranges[1]
+    volume_accelerating = volumes[-1] > volumes[0] and volumes[-1] > volumes[1]
+    if not (range_accelerating and volume_accelerating):
+        return False, {}
+
+    # ── SNAPBACK BAR: single green candle clearing 2+ prior red bars ──
+    snap_bar  = r[-1]
+    snap_prev = r[-2]
+    snap_prev2 = r[-3] if len(r) >= 3 else None
+
+    is_green = snap_bar["c"] > snap_bar["o"]
+    if not is_green:
+        return False, {}
+
+    # Must clear the highs of at least 2 preceding red candles ("double bar break")
+    prior_reds = [c for c in r[-4:-1] if c["c"] < c["o"]]
+    if len(prior_reds) < 2:
+        return False, {}
+    max_prior_red_high = max(c["h"] for c in prior_reds)
+    cleared_highs = snap_bar["h"] > max_prior_red_high
+    if not cleared_highs:
+        return False, {}
+
+    # Snapback bar must be one of the 5 highest volume bars of the session
+    all_vols   = sorted([c["v"] for c in r], reverse=True)
+    top5_thresh = all_vols[4] if len(all_vols) >= 5 else all_vols[-1]
+    if snap_bar["v"] < top5_thresh:
+        return False, {}
+
+    # ── STOP & TARGETS (per PDF) ──
+    lod       = min(c["l"] for c in r)
+    stop_px   = round(lod - 0.02, 2)
+    risk      = snap_bar["c"] - stop_px
+    tgt1      = round(snap_bar["c"] + risk, 2)       # 1R
+    tgt2      = round(snap_bar["c"] + risk * 2, 2)   # 2R
+    tgt3      = round(vw, 2) if vw else None          # VWAP
+
+    # ── SCORE ──
+    base  = 68
+    score = base
+    score += 12 if rvol >= 5.0 else (6 if rvol >= 3.0 else 0)
+    score += 8  if extension >= 4.0 else (4 if extension >= 3.0 else 0)
+    score += 8  if range_accelerating and volume_accelerating else 0
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    return True, {
+        "setup":   "RUBBER_BAND_SCALP_LONG",
+        "dir":     "🟢 LONG",
+        "trigger": f"Snapback candle cleared 2+ red bar highs (double bar break) — enter aggressively",
+        "inval":   f"${stop_px} ($0.02 below LOD ${round(lod, 2)})",
+        "level":   (f"Entry: ${round(snap_bar['c'], 2)} | Stop: ${stop_px} | "
+                    f"T1: ${tgt1} (1R) | T2: ${tgt2} (2R) | T3: VWAP ${round(vw, 2) if vw else 'N/A'}"),
+        "vol":     f"RVOL {rvol}x ✅ | Snap bar top-5 volume ✅",
+        "score":   score,
+        "action":  "Aggressive entry — don't wait for bar close",
+        "notes":   (f"Rubber Band | {round(extension, 1)} ATRs extended | "
+                    f"Accel: range ✅ vol ✅ | Exit 1/3 at 1R, 1/3 at 2R, 1/3 into VWAP"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def second_chance_scalp_long(c5, p, vw, pmh_v, pdh, rvol, rs_mod, rs_tier="?", spy_ctx=None):
+    """
+    Second Chance Scalp — Long (SMB)
+
+    The setup: range break → pullback to breakout level (old resistance
+    becomes new support) → confirmation candle closes above prior candle.
+
+    This is a sniper entry — you're waiting for the RETEST and confirmation,
+    not chasing the initial break.
+
+    Three phases (all must be present):
+    1. BREAK: strong candle closes above resistance (PMH, PDH, or intraday range high)
+    2. RETEST: price pulls back to the broken level on LOW volume
+    3. CONFIRM: candle closes above the prior candle at the retest zone
+
+    Hard invalids:
+    - Initial break > prior range height (over-extension)
+    - Price breaks back into range and doesn't recover next candle
+    - Market fighting direction of trade
+    """
+    ts = now_et()
+    # Valid all day: 9:59–16:00
+    if not in_window(ts, 9, 59, 16, 0):
+        return False, {}
+
+    r = rh(c5)
+    if len(r) < 6:
+        return False, {}
+
+    # Need a key level to test — use PMH or PDH
+    key_level = pmh_v or pdh
+    if not key_level:
+        return False, {}
+
+    last, prev = r[-1], r[-2]
+
+    # ── PHASE 1: Confirm a break occurred (a prior bar closed above key level) ──
+    prior_bars = r[:-2]
+    break_bar  = next((c for c in reversed(prior_bars) if c["c"] > key_level * 1.001), None)
+    if not break_bar:
+        return False, {}
+
+    # ── PHASE 2: Retest — price came back to within 0.4% of key level ──
+    at_retest = abs(p - key_level) / key_level <= 0.004
+    if not at_retest:
+        return False, {}
+
+    # Retest volume should be LOWER than break volume (lack of seller urgency)
+    retest_vol_ok = prev["v"] < break_bar["v"] * 0.85
+
+    # ── PHASE 3: Confirmation — current bar closes above previous bar ──
+    confirmed = last["c"] > prev["h"]
+    if not confirmed:
+        return False, {}
+
+    # Price must be above the key level (holding as support, not breaking back in)
+    if p < key_level * 0.998:
+        return False, {}
+
+    # Market direction alignment
+    if spy_ctx:
+        spy_dir = spy_ctx.get("recent_dir", "flat")
+        if spy_dir == "down":
+            return False, {}
+
+    # ── OVER-EXTENSION CHECK ──
+    # Find the prior range height before the break
+    # Break move should be <= prior range height
+    bars_before_break = [c for c in prior_bars if c["ts"] < break_bar["ts"]]
+    if len(bars_before_break) >= 3:
+        recent_range_bars = bars_before_break[-6:]
+        range_high = max(c["h"] for c in recent_range_bars)
+        range_low  = min(c["l"] for c in recent_range_bars)
+        prior_range_height = range_high - range_low
+        break_move = break_bar["h"] - key_level
+        if prior_range_height > 0 and break_move > prior_range_height * 1.1:
+            return False, {}   # over-extension
+
+    # ── STOP & TARGET ──
+    stop_px  = round(prev["l"] - 0.02, 2)   # $0.02 below low of turn candle
+    pullback_high = max(c["h"] for c in r[r.index(break_bar):] if c["ts"] <= prev["ts"])
+    tgt1     = round(pullback_high, 2)        # high of initial pullback
+    risk     = last["c"] - stop_px
+
+    # ── SCORE ──
+    base  = 65
+    score = base
+    score += 8  if retest_vol_ok else 0
+    score += 6  if rvol and rvol >= RVOL_MIN else 0
+    score += 5  if (spy_ctx or {}).get("recent_dir") == "up" else 0
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    return True, {
+        "setup":   "SECOND_CHANCE_SCALP_LONG",
+        "dir":     "🟢 LONG",
+        "trigger": f"2nd chance confirm: closed above prior bar at retest of ${round(key_level, 2)}",
+        "inval":   f"${stop_px} ($0.02 below turn candle low ${round(prev['l'], 2)})",
+        "level":   (f"Key level: ${round(key_level, 2)} | Stop: ${stop_px} | "
+                    f"T1: ${tgt1} (pullback high) | Trail: 1-min close below 9 EMA"),
+        "vol":     f"Break vol high ✅ Retest vol {'low ✅' if retest_vol_ok else 'elevated ⚠️'} RVOL {rvol}x",
+        "score":   score,
+        "action":  "Actionable — 2 strikes and out on this setup",
+        "notes":   f"2nd Chance | Level: ${round(key_level, 2)} | Risk: ${round(risk, 2)} | Exit half at T1, trail rest on 1-min 9 EMA",
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
+def hitchhiker_scalp_long(c5, c1, p, vw, pmh_v, pdh, rvol, rs_mod, rs_tier="?", spy_ctx=None):
+    """
+    HitchHiker Scalp — Long (SMB)
+
+    Opening drive + NO pullback + sideways consolidation = institutional buy program.
+    Entry on break of 1-min bar range (the HitchHiker candle) — aggressively,
+    before bar close.
+
+    Critical requirements from PDF:
+    - Distinct drive higher off open (not just one big candle)
+    - Stock does NOT pull back — holds up and goes sideways
+    - Consolidation 5–20 minutes in duration
+    - Consolidation LOW in upper 1/3 of day's trading range
+    - Must set up before 9:59 AM (opening drive trade only)
+    - Consolidation above PMH or PDH for highest probability
+    - No choppy consolidation (large wicks = invalid)
+    """
+    ts = now_et()
+    # Opening drive only — must set up before 9:59 AM
+    if not in_window(ts, 9, 30, 9, 59):
+        return False, {}
+
+    r  = rh(c5)
+    r1 = rh(c1) if c1 else []
+    if len(r) < 3 or len(r1) < 5:
+        return False, {}
+
+    # ── OPENING DRIVE: must have multiple bars going higher (not one candle) ──
+    drive_bars = r[:3]   # first 3 five-min bars
+    drive_valid = all(c["c"] > c["o"] for c in drive_bars[:2])   # first 2 bars green
+    if not drive_valid:
+        return False, {}
+
+    # ── NO PULLBACK: price should not have come back to open price ──
+    open_price  = r[0]["o"]
+    drive_high  = max(c["h"] for c in drive_bars)
+    current_pos = (p - open_price) / (drive_high - open_price) if drive_high > open_price else 0
+    if current_pos < 0.50:   # price has retraced more than 50% of the drive = not valid
+        return False, {}
+
+    # ── CONSOLIDATION DETECTION on 1-min bars ──
+    # Look at last 5–20 1-min bars for a tight sideways range
+    consol_bars = r1[-20:]   # max 20 bars = 20 minutes
+    if len(consol_bars) < 5:
+        return False, {}
+
+    consol_high = max(c["h"] for c in consol_bars)
+    consol_low  = min(c["l"] for c in consol_bars)
+    consol_range = consol_high - consol_low
+
+    # Consolidation must be tight — range < 1x ATR
+    atr_val = atr(c5)
+    if not atr_val or consol_range > atr_val:
+        return False, {}
+
+    # Consolidation low must be in upper 1/3 of day's range
+    day_high = max(c["h"] for c in r)
+    day_low  = min(c["l"] for c in r)
+    day_range = day_high - day_low
+    if day_range > 0:
+        consol_low_pos = (consol_low - day_low) / day_range
+        if consol_low_pos < 0.67:   # not in upper 1/3
+            return False, {}
+
+    # ── NO CHOPPY CONSOLIDATION: wicks must be small ──
+    avg_wick = sum(
+        (c["h"] - max(c["o"], c["c"])) + (min(c["o"], c["c"]) - c["l"])
+        for c in consol_bars
+    ) / len(consol_bars)
+    avg_body  = sum(abs(c["c"] - c["o"]) for c in consol_bars) / len(consol_bars)
+    if avg_body > 0 and avg_wick > avg_body * 1.5:   # large wicks = choppy = invalid
+        return False, {}
+
+    # ── HITCHHIKER CANDLE: current 1-min bar breaking above consolidation high ──
+    # Entry is on the break of range, not bar close
+    hitchhiker_trigger = p > consol_high * 1.001
+    if not hitchhiker_trigger:
+        return False, {}
+
+    # Volume: break candle should have 30%+ more volume than prior candle
+    if len(r1) >= 2:
+        vol_increase = r1[-1]["v"] > r1[-2]["v"] * 1.30
+    else:
+        vol_increase = False
+
+    # Consolidation above key resistance (PMH or PDH) for higher probability
+    above_key_level = False
+    if pmh_v and consol_low > pmh_v:
+        above_key_level = True
+    if pdh and consol_low > pdh:
+        above_key_level = True
+
+    # Market alignment
+    if spy_ctx:
+        spy_dir = spy_ctx.get("recent_dir", "flat")
+        if spy_dir == "down":
+            return False, {}
+
+    # ── STOP & TARGET ──
+    stop_px = round(consol_low - 0.02, 2)
+    risk    = p - stop_px
+    tgt1    = round(p + risk, 2)      # first wave
+    tgt2    = round(p + risk * 2, 2)  # second wave
+
+    # ── SCORE ──
+    base  = 70
+    score = base
+    score += 8  if vol_increase else 0
+    score += 8  if above_key_level else 0
+    score += 5  if rvol and rvol >= RVOL_MIN else 0
+    score += 5  if (spy_ctx or {}).get("recent_dir") == "up" else 0
+    score += rs_mod
+    score += time_of_day_modifier()
+
+    if rs_tier in ("C", "D"):
+        return False, {}
+
+    score = clamp_score(score)
+    if score < MIN_SCORE:
+        return False, {}
+
+    return True, {
+        "setup":   "HITCHHIKER_SCALP_LONG",
+        "dir":     "🟢 LONG",
+        "trigger": f"HitchHiker candle breaking above consolidation ${round(consol_high, 2)} — enter NOW",
+        "inval":   f"${stop_px} ($0.02 below consolidation low ${round(consol_low, 2)})",
+        "level":   (f"Consol: ${round(consol_low, 2)}–${round(consol_high, 2)} | "
+                    f"Stop: ${stop_px} | T1: ${tgt1} | T2: ${tgt2}"),
+        "vol":     f"Break vol {'30%+ increase ✅' if vol_increase else 'watch'} RVOL {rvol}x",
+        "score":   score,
+        "action":  "Aggressive — enter on range break, don't wait for close",
+        "notes":   (f"HitchHiker | Consol range: ${round(consol_range, 2)} | "
+                    f"Upper 1/3: ✅ | {'Above key level ✅' if above_key_level else 'No key level'} | "
+                    f"One-and-done stop"),
+        "trigger_bar_ts": _trigger_bar(r),
+    }
+
+
 def sweep_watch_long_v2(c2, p, vw):
     r = rh(c2)
     if len(r) < 8:
@@ -2521,6 +3347,12 @@ class Scanner:
                  lambda: later_day_hod_breakout(c5, p, vw, rvol, rs_mod, rs_tier)),
                 ("FIB_PULLBACK_LONG",
                  lambda: fib_pullback_long(c5, p, vw, rvol)),
+                ("FASHIONABLY_LATE_LONG",
+                 lambda: fashionably_late_long(c5, p, vw, rvol, rs_mod, rs_tier, self._spy_ctx)),
+                ("RUBBER_BAND_SCALP_LONG",
+                 lambda: rubber_band_scalp_long(c5, c1, p, vw, rvol, rs_mod, rs_tier, self._spy_ctx)),
+                ("HITCHHIKER_SCALP_LONG",
+                 lambda: hitchhiker_scalp_long(c5, c1, p, vw, pmh_v, pdh, rvol, rs_mod, rs_tier, self._spy_ctx)),
 
                 # ── SHORT setups — use short RS (inverted) ──
                 ("PML_BREAK_RETEST_SHORT",
@@ -2537,6 +3369,10 @@ class Scanner:
                  lambda: pdl_retest(c5, p, vw, pdl, rvol, rs_mod_short, rs_tier_short)),
                 ("FIB_PULLBACK_SHORT",
                  lambda: fib_pullback_short(c5, p, vw, rvol)),
+                ("FASHIONABLY_LATE_SHORT",
+                 lambda: fashionably_late_short(c5, p, vw, rvol, rs_mod_short, rs_tier_short, self._spy_ctx)),
+                ("SECOND_CHANCE_SCALP_LONG",
+                 lambda: second_chance_scalp_long(c5, p, vw, pmh_v, pdh, rvol, rs_mod, rs_tier, self._spy_ctx)),
             ]
 
             for name, fn in setups:
@@ -2669,7 +3505,7 @@ class Scanner:
                        f"dir={spy.get('recent_dir','?')} | "
                        f"ATR={spy.get('atr_pct','N/A')}%")
             send_alert(
-                f"📊 <b>Scanner v3.12</b>\n"
+                f"📊 <b>Scanner v3.15</b>\n"
                 f"Stocks: {len(self.wl)} | Armed: {len(self.armed)}\n"
                 f"Min score: {MIN_SCORE}/100\n"
                 f"Active fired signals: {len(self.fired_signals)}\n"
@@ -2760,9 +3596,9 @@ class Scanner:
             )
 
     def run(self):
-        print("[SCANNER] v3.12 starting")
+        print("[SCANNER] v3.15 starting")
         send_alert(
-            f"🤖 <b>Scanner v3.12 Online</b>\n{'━' * 28}\n"
+            f"🤖 <b>Scanner v3.15 Online</b>\n{'━' * 28}\n"
             f"Watching <b>{len(self.wl)} stocks</b> | Armed <b>{len(self.armed)}</b>\n"
             f"Threshold ≥ {MIN_SCORE}/100\n{'━' * 28}\n"
             f"<b>New in v3.8 — Direction-Aware RS:</b>\n"
