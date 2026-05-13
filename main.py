@@ -946,18 +946,20 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     """
     Classify whether price approached the EMA from ABOVE or BELOW.
 
-    TIGHTENED in v3.15:
-    - Looks back 8 bars total (was prior_bars + max_cross which was only 4-5)
-    - Zero cross tolerance (EMA_MAX_CROSS_BARS = 0) — any bar on the wrong
-      side in the 8-bar window = MIXED, not a clean pullback
-    - This directly kills the "approaching from below" false long alerts
-      because any bar below EMA in the window returns "mixed" which blocks
-      the long setup entirely
+    UPGRADED: Now uses candle BODY midpoint instead of just close price.
+    A bar that closes barely above the EMA but has its entire body below
+    it is classified as a "below" bar. This fixes the core false signal —
+    price surging into the EMA from below, body below EMA, close just
+    crossing — was being classified as "from_above" incorrectly.
 
-    The VWAP hard gate in each setup function is the primary blocker.
-    This is the secondary/confirmation filter.
+    Body midpoint = (open + close) / 2. This is more representative of
+    where price actually spent time during that bar than the close alone.
+    A wick that pokes through the EMA doesn't count as being above it.
+
+    Also checks: prior swing high must exist above EMA (confirms price
+    was actually up there and pulled back, not approached from below).
     """
-    LOOKBACK = 8   # always look back 8 bars regardless of prior_bars_required
+    LOOKBACK = 8
     if len(r) < LOOKBACK + 1 or len(es) < LOOKBACK + 1:
         return "insufficient_data", 0, 0
 
@@ -969,7 +971,9 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     for bar, ema_val in zip(check_bars, check_emas):
         if ema_val is None:
             continue
-        if bar["c"] > ema_val:
+        # Use body midpoint — not just close
+        body_mid = (bar["o"] + bar["c"]) / 2
+        if body_mid > ema_val:
             above_count += 1
         else:
             below_count += 1
@@ -978,13 +982,79 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     if total == 0:
         return "insufficient_data", 0, 0
 
-    # Zero cross tolerance — any bar on wrong side = mixed
     if above_count >= prior_bars_required and below_count == 0:
         return "from_above", above_count, below_count
     elif below_count >= prior_bars_required and above_count == 0:
         return "from_below", above_count, below_count
     else:
         return "mixed", above_count, below_count
+
+
+def _candle_approach_direction(r, es, lookback=4):
+    """
+    Determine whether price is approaching the EMA from above or below
+    by analyzing the CHARACTER of the bars leading into the touch.
+
+    For a valid LONG pullback (approaching from above):
+    - The last 2-4 bars before the touch should show DECLINING closes
+      (price came down to the EMA — it was higher before)
+    - The open of the touch bar should be ABOVE or AT the EMA
+      (price opened above EMA and dipped to touch it, not surged up to it)
+    - There must be a prior swing high ABOVE the current EMA level
+      in the last 10 bars (price was up there and came back down)
+
+    For a false long (approaching from below):
+    - The bars leading to the touch show RISING closes (price surging up)
+    - The open of the touch bar is BELOW the EMA (opened below, trying to break through)
+    - No prior swing high above the EMA — price was never up there
+
+    Returns: "pullback_long", "pullback_short", or "false_approach"
+    """
+    if len(r) < lookback + 2 or len(es) < lookback + 2:
+        return "insufficient_data"
+
+    en = es[-1]
+    if en is None:
+        return "insufficient_data"
+
+    last = r[-1]
+    touch_bar_open = last["o"]
+
+    # Check 1: open of touch bar relative to EMA
+    # Valid long pullback: bar opened at or above EMA (came down to it)
+    # False approach from below: bar opened below EMA (surging up through it)
+    open_above_ema = touch_bar_open >= en * 0.997   # within 0.3% counts as "at"
+
+    # Check 2: character of preceding bars (were closes declining or rising?)
+    pre_bars = r[-(lookback + 1):-1]
+    if len(pre_bars) >= 2:
+        closes = [c["c"] for c in pre_bars]
+        # Declining closes = pullback character (good for long)
+        # Rising closes = approach from below character (bad for long, good for short entry)
+        net_change = closes[-1] - closes[0]
+        declining_approach = net_change < 0   # closes fell into the EMA
+        rising_approach    = net_change > 0   # closes rose into the EMA
+    else:
+        declining_approach = False
+        rising_approach    = False
+
+    # Check 3: prior swing high above EMA (was price up there before?)
+    # Look back 10 bars for a high significantly above the current EMA
+    prior_bars = r[-11:-1] if len(r) >= 11 else r[:-1]
+    prior_swing_high = max((c["h"] for c in prior_bars), default=0)
+    had_swing_high_above = prior_swing_high > en * 1.005   # at least 0.5% above EMA
+
+    # Classify
+    if open_above_ema and declining_approach and had_swing_high_above:
+        return "pullback_long"   # clean pullback from above — valid long
+    elif not open_above_ema and rising_approach and not had_swing_high_above:
+        return "false_approach"  # surging from below — false long signal
+    elif not open_above_ema and rising_approach:
+        return "false_approach"  # opened below EMA, rising into it
+    elif open_above_ema and rising_approach:
+        return "false_approach"  # opened above but rising = not a pullback, a continuation
+    else:
+        return "ambiguous"       # unclear — let other gates decide
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1433,10 +1503,17 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if en is None:
         return False, {}
 
-    # GATE 2 — direction context: approached from above
+    # GATE 2 — direction context: approached from above (body-based)
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
     if ctx != "from_above":
         return False, {}
+
+    # GATE 2b — candlestick approach character
+    # Confirms price actually PULLED BACK to EMA vs approached from below
+    approach = _candle_approach_direction(r, es, lookback=4)
+    if approach in ("false_approach",):
+        return False, {}
+    # "ambiguous" is allowed — other gates handle it
 
     # GATE 3 — EMA slope must be meaningful (0.03% of price per bar minimum)
     # This kills flat/ranging stocks where EMA drifted up into price
@@ -1524,6 +1601,24 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if ctx != "from_below":
         return False, {}
 
+    # Candlestick approach character — inverted for short
+    # Valid short: bar opens below or at EMA, prior bars rising (bounce into EMA)
+    # False short: price pulling away from above (not a rejection)
+    en_short = es[-1]
+    if en_short is not None:
+        last_short = r[-1]
+        pre_short  = r[-5:-1]
+        open_below_ema = last_short["o"] <= en_short * 1.003
+        if len(pre_short) >= 2:
+            closes_s = [c["c"] for c in pre_short]
+            rising_into = closes_s[-1] > closes_s[0]   # bounced up into EMA
+        else:
+            rising_into = False
+        # Valid short: opened at/below EMA AND prior bars rose into it
+        # False short: opened well above EMA and coming down (that's a long pullback)
+        if not open_below_ema and not rising_into:
+            return False, {}
+
     ema_vals = [e for e in es[-6:] if e is not None]
     if len(ema_vals) < 4:
         return False, {}
@@ -1593,6 +1688,11 @@ def ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
 
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_10M)
     if ctx != "from_above":
+        return False, {}
+
+    # Candlestick approach: confirm pullback character not upward approach
+    approach10 = _candle_approach_direction(r, es, lookback=3)
+    if approach10 == "false_approach":
         return False, {}
 
     ema_vals   = [e for e in es[-4:] if e is not None]
@@ -3259,9 +3359,14 @@ def ema9_2m_first_pullback_long(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod,
     if not (ema_stacked and ema21_rising):
         return False, {}
 
-    # ── GATE 5: Direction — approached from above ──
+    # ── GATE 5: Direction — approached from above (body-based) ──
     ctx2, bars_above2, _ = ema_position_context(r2, es2, 4)
     if ctx2 != "from_above":
+        return False, {}
+
+    # Candlestick approach character — pullback must have declining closes
+    approach2 = _candle_approach_direction(r2, es2, lookback=4)
+    if approach2 == "false_approach":
         return False, {}
 
     # ── GATE 6: Touch count — first or second only ──
@@ -3416,10 +3521,23 @@ def ema9_2m_first_pullback_short(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod
     if not (ema_stacked and ema21_falling):
         return False, {}
 
-    # Direction — approached from below
+    # Direction — approached from below (body-based)
     ctx2, _, bars_below2 = ema_position_context(r2, es2, 4)
     if ctx2 != "from_below":
         return False, {}
+
+    # For short: bar opened at/below EMA, prior closes rising into it
+    en2_s = es2[-1]
+    if en2_s is not None:
+        last2_s = r2[-1]
+        pre_s   = r2[-5:-1]
+        open_at_or_below = last2_s["o"] <= en2_s * 1.003
+        if len(pre_s) >= 2:
+            rising_into_s = pre_s[-1]["c"] > pre_s[0]["c"]
+        else:
+            rising_into_s = False
+        if not open_at_or_below and not rising_into_s:
+            return False, {}
 
     # Touch count — first or second only
     touch_count = sum(
