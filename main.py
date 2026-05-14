@@ -1329,7 +1329,7 @@ def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod, rs_tier="?"):
     bars_since_break = len(r) - 2 - last_break_idx   # bars since the break
 
     # TIME GATE: break must have happened within 12 bars (~60 min)
-    if bars_since_break > 12:
+    if bars_since_break > 20:   # raised from 12 — 100min window
         return False, {}
 
     near       = abs(p - pmh_v) / pmh_v <= 0.004
@@ -1373,7 +1373,7 @@ def pml_retest(c5, p, vw, pml_v, rvol, rs_mod, rs_tier="?"):
         return False, {}
     last_break_idx   = break_bars[-1]
     bars_since_break = len(r) - 2 - last_break_idx
-    if bars_since_break > 12:
+    if bars_since_break > 20:   # raised from 12 — 100min window
         return False, {}
     near         = abs(p - pml_v) / pml_v <= 0.004
     below        = p <= pml_v * 1.002
@@ -1507,13 +1507,9 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
     if ctx != "from_above":
         return False, {}
-
-    # GATE 2b — candlestick approach character
-    # Confirms price actually PULLED BACK to EMA vs approached from below
-    approach = _candle_approach_direction(r, es, lookback=4)
-    if approach in ("false_approach",):
-        return False, {}
-    # "ambiguous" is allowed — other gates handle it
+    # Note: _candle_approach_direction removed — it incorrectly flagged valid
+    # uptrend pullbacks as "false_approach" when pre-bars showed rising closes
+    # (which is normal on a strong trend before the pullback bar)
 
     # GATE 3 — EMA slope must be meaningful (0.03% of price per bar minimum)
     # This kills flat/ranging stocks where EMA drifted up into price
@@ -1521,7 +1517,7 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if len(ema_vals) < 4:
         return False, {}
     slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 / len(ema_vals)
-    if slope_pct < 0.03:   # EMA rising less than 0.03% per bar = essentially flat
+    if slope_pct < 0.015:   # lowered from 0.03 — mature trends have lower slope
         return False, {}
 
     # GATE 4 — touch count: max 2 EMA touches this session
@@ -1530,16 +1526,19 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
         1 for i, (bar, ema_v) in enumerate(zip(r[:-1], es[:-1]))
         if ema_v is not None and bar["l"] <= ema_v * 1.003
     )
-    if touch_count > 2:
+    if touch_count > 3:   # raised — strong trends have 3+ valid pullbacks
         return False, {}
 
     last, prev = r[-1], r[-2]
 
-    # GATE 5 — volume dry-up REQUIRED (not a bonus)
+    # GATE 5 — volume check (score modifier, not hard gate)
+    # On strong trend days volume is elevated session-wide — a hard gate here
+    # blocks every EMA pullback on GOOGL/AAPL running all day.
+    # Score: dry-up = +10 bonus, elevated = no penalty (stock is just in play)
+    # Only block if volume is EXPANDING significantly on the pullback (sellers pushing)
     _, _, vol_ratio = vol_baseline(c5)
-    if vol_ratio is None or vol_ratio > 0.80:
-        # Volume not drying up = sellers still active on pullback = not clean
-        return False, {}
+    vol_expanding_on_pb = vol_ratio is not None and vol_ratio > 1.50
+    light_pb            = vol_ratio is not None and vol_ratio <= 0.80
 
     # Must be touching the EMA
     touched = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
@@ -1553,11 +1552,16 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if bar_range < min_range or close_pos < 0.40:
         return False, {}
 
+    # Block only if volume actively EXPANDING on pullback (sellers in control)
+    if vol_expanding_on_pb:
+        return False, {}
+
     above_vwap = p > (vw or 0)
     rising     = slope_pct > 0
 
     score = _apply_quality_modifiers(
-        68 + (8 if touch_count == 1 else 3) + (5 if above_vwap else 0) + (5 if rising else 0),
+        68 + (8 if touch_count == 1 else 3) + (5 if above_vwap else 0)
+           + (10 if light_pb else 0) + (5 if rising else 0),
         rvol, rs_mod
     )
     if score < MIN_SCORE:
@@ -1601,24 +1605,6 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if ctx != "from_below":
         return False, {}
 
-    # Candlestick approach character — inverted for short
-    # Valid short: bar opens below or at EMA, prior bars rising (bounce into EMA)
-    # False short: price pulling away from above (not a rejection)
-    en_short = es[-1]
-    if en_short is not None:
-        last_short = r[-1]
-        pre_short  = r[-5:-1]
-        open_below_ema = last_short["o"] <= en_short * 1.003
-        if len(pre_short) >= 2:
-            closes_s = [c["c"] for c in pre_short]
-            rising_into = closes_s[-1] > closes_s[0]   # bounced up into EMA
-        else:
-            rising_into = False
-        # Valid short: opened at/below EMA AND prior bars rose into it
-        # False short: opened well above EMA and coming down (that's a long pullback)
-        if not open_below_ema and not rising_into:
-            return False, {}
-
     ema_vals = [e for e in es[-6:] if e is not None]
     if len(ema_vals) < 4:
         return False, {}
@@ -1631,7 +1617,7 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
         1 for bar, ema_v in zip(r[:-1], es[:-1])
         if ema_v is not None and bar["h"] >= ema_v * 0.997
     )
-    if touch_count > 2:
+    if touch_count > 3:   # raised — strong trends have 3+ valid pullbacks
         return False, {}
 
     last, prev = r[-1], r[-2]
@@ -1688,11 +1674,6 @@ def ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier="?"):
 
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_10M)
     if ctx != "from_above":
-        return False, {}
-
-    # Candlestick approach: confirm pullback character not upward approach
-    approach10 = _candle_approach_direction(r, es, lookback=3)
-    if approach10 == "false_approach":
         return False, {}
 
     ema_vals   = [e for e in es[-4:] if e is not None]
@@ -2107,14 +2088,14 @@ def later_day_hod_breakout(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     # FRESHNESS GATE: HOD must have been set within last 10 bars (~50 min)
     # If HOD was set 20 bars ago and price has been below it since, it's stale
     bars_since_hod = len(prior_bars) - 1 - hod_idx
-    if bars_since_hod > 10:
+    if bars_since_hod > 20:   # raised — allow 100min consolidation before break
         return False, {}
 
     # BASE GATE: at least 3 of last 5 bars (before current) must be below HOD
     # This confirms a real base was built, not just a single dip and pop
     base_check_bars = r[-6:-1]
     bars_below_hod  = sum(1 for c in base_check_bars if c["h"] <= hod_val * 1.002)
-    if bars_below_hod < 3:
+    if bars_below_hod < 1:   # lowered — just need 1 pause bar below HOD
         return False, {}
 
     # BREAK GATE: current bar must be breaking above HOD
@@ -3364,10 +3345,6 @@ def ema9_2m_first_pullback_long(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod,
     if ctx2 != "from_above":
         return False, {}
 
-    # Candlestick approach character — pullback must have declining closes
-    approach2 = _candle_approach_direction(r2, es2, lookback=4)
-    if approach2 == "false_approach":
-        return False, {}
 
     # ── GATE 6: Touch count — first or second only ──
     touch_count = sum(
@@ -3526,18 +3503,6 @@ def ema9_2m_first_pullback_short(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod
     if ctx2 != "from_below":
         return False, {}
 
-    # For short: bar opened at/below EMA, prior closes rising into it
-    en2_s = es2[-1]
-    if en2_s is not None:
-        last2_s = r2[-1]
-        pre_s   = r2[-5:-1]
-        open_at_or_below = last2_s["o"] <= en2_s * 1.003
-        if len(pre_s) >= 2:
-            rising_into_s = pre_s[-1]["c"] > pre_s[0]["c"]
-        else:
-            rising_into_s = False
-        if not open_at_or_below and not rising_into_s:
-            return False, {}
 
     # Touch count — first or second only
     touch_count = sum(
