@@ -946,20 +946,16 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     """
     Classify whether price approached the EMA from ABOVE or BELOW.
 
-    UPGRADED: Now uses candle BODY midpoint instead of just close price.
-    A bar that closes barely above the EMA but has its entire body below
-    it is classified as a "below" bar. This fixes the core false signal —
-    price surging into the EMA from below, body below EMA, close just
-    crossing — was being classified as "from_above" incorrectly.
+    Uses CLOSE price (not body midpoint — body midpoint broke the setup
+    because pullback bars by definition have their close near/at the EMA
+    which means body_mid registers as 'below' even on valid pullbacks).
 
-    Body midpoint = (open + close) / 2. This is more representative of
-    where price actually spent time during that bar than the close alone.
-    A wick that pokes through the EMA doesn't count as being above it.
+    Allows 1 cross bar (the pullback bar itself touching the EMA counts
+    as 1 cross — zero tolerance was blocking every legitimate pullback).
 
-    Also checks: prior swing high must exist above EMA (confirms price
-    was actually up there and pulled back, not approached from below).
+    Lookback: 6 bars (8 was catching too many transitional bars).
     """
-    LOOKBACK = 8
+    LOOKBACK = 6
     if len(r) < LOOKBACK + 1 or len(es) < LOOKBACK + 1:
         return "insufficient_data", 0, 0
 
@@ -971,9 +967,7 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     for bar, ema_val in zip(check_bars, check_emas):
         if ema_val is None:
             continue
-        # Use body midpoint — not just close
-        body_mid = (bar["o"] + bar["c"]) / 2
-        if body_mid > ema_val:
+        if bar["c"] > ema_val:
             above_count += 1
         else:
             below_count += 1
@@ -982,9 +976,11 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     if total == 0:
         return "insufficient_data", 0, 0
 
-    if above_count >= prior_bars_required and below_count == 0:
+    # Allow 1 cross bar — the pullback bar touching the EMA is valid
+    ALLOWED_CROSS = 1
+    if above_count >= prior_bars_required and below_count <= ALLOWED_CROSS:
         return "from_above", above_count, below_count
-    elif below_count >= prior_bars_required and above_count == 0:
+    elif below_count >= prior_bars_required and above_count <= ALLOWED_CROSS:
         return "from_below", above_count, below_count
     else:
         return "mixed", above_count, below_count
