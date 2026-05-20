@@ -126,17 +126,15 @@ BASE      = "https://api.schwabapi.com/marketdata/v1"
 DEFAULT_WATCHLIST = [
     "NVDA", "AMD", "TSLA", "PLTR", "AMZN", "MU", "MSFT", "GOOGL",
     "AAPL", "AVGO", "META", "DELL", "RKLB", "MRVL",
-    "QCOM", "AAOI", "ARM", "INTC"
+    "CRDO", "LITE", "COHR", "AAOI", "ARM", "INTC"
 ]
-# Removed: XOM, CVX, COIN, ANET, CRDO, LITE, COHR per user request.
-# Added: QCOM (strong mover, options liquid), kept INTC and AAOI as catalysts.
-# Set WATCHLIST env var in Railway to make changes persist across restarts.
+# NOTE: XOM, CVX, COIN, ANET removed per user request.
 # The watchlist is persisted in watchlist_state.json on Railway.
 # If that file is missing on restart, this default is used.
 # To permanently remove a ticker use /remove — it updates watchlist_state.json.
 # The DEFAULT_WATCHLIST is the fallback for fresh deploys only.
 
-MIN_SCORE = 70  # raised from 60 — requires genuine quality signal beyond baseline
+MIN_SCORE = 60
 COOLDOWN  = 15
 
 # Timing windows
@@ -161,10 +159,6 @@ SIGNAL_TTL = {
     "VWAP_REJECT_SHORT":        15,
     "EMA9_5M_PULLBACK_LONG":    12,
     "EMA9_5M_PULLBACK_SHORT":   12,
-    "EMA9_2M_FIRST_PULLBACK_LONG":  10,
-    "EMA9_2M_FIRST_PULLBACK_SHORT": 10,
-    "EMA_STACK_MOMENTUM_LONG":      20,
-    "EMA_STACK_MOMENTUM_SHORT":     20,
     "EMA9_10M_PULLBACK_LONG":   18,
     "EMA9_10M_PULLBACK_SHORT":  18,
     "EMA4_10M_RIDER_LONG":      20,
@@ -625,33 +619,6 @@ def pm_low(ticker):
     return min(x["low"] for x in cs) if cs else None
 
 
-def daily_atr21(ticker):
-    """
-    Fetch last 21 daily bars and compute true ATR.
-    Called once per day per ticker, cached in self.datr.
-    This gives the real 21-day ATR that shows on your TOS chart —
-    the baseline against which we measure whether today's move is
-    60-70%+ of ATR (genuinely in play) or just drifting.
-    """
-    try:
-        d = _get(f"/pricehistory?symbol={ticker}", {
-            "periodType": "month", "period": 2,
-            "frequencyType": "daily", "frequency": 1,
-            "needExtendedHoursData": "false",
-        })
-        bars = d.get("candles", [])[-22:]
-        if len(bars) < 2:
-            return None
-        trs = []
-        for i in range(1, len(bars)):
-            h, l, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
-            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-        recent = trs[-21:]
-        return round(sum(recent) / len(recent), 2) if recent else None
-    except Exception:
-        return None
-
-
 def prior_day(ticker):
     try:
         d = _get(f"/pricehistory?symbol={ticker}", {
@@ -946,16 +913,18 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     """
     Classify whether price approached the EMA from ABOVE or BELOW.
 
-    Uses CLOSE price (not body midpoint — body midpoint broke the setup
-    because pullback bars by definition have their close near/at the EMA
-    which means body_mid registers as 'below' even on valid pullbacks).
+    TIGHTENED in v3.15:
+    - Looks back 8 bars total (was prior_bars + max_cross which was only 4-5)
+    - Zero cross tolerance (EMA_MAX_CROSS_BARS = 0) — any bar on the wrong
+      side in the 8-bar window = MIXED, not a clean pullback
+    - This directly kills the "approaching from below" false long alerts
+      because any bar below EMA in the window returns "mixed" which blocks
+      the long setup entirely
 
-    Allows 1 cross bar (the pullback bar itself touching the EMA counts
-    as 1 cross — zero tolerance was blocking every legitimate pullback).
-
-    Lookback: 6 bars (8 was catching too many transitional bars).
+    The VWAP hard gate in each setup function is the primary blocker.
+    This is the secondary/confirmation filter.
     """
-    LOOKBACK = 6
+    LOOKBACK = 8   # always look back 8 bars regardless of prior_bars_required
     if len(r) < LOOKBACK + 1 or len(es) < LOOKBACK + 1:
         return "insufficient_data", 0, 0
 
@@ -976,81 +945,13 @@ def ema_position_context(r, es, prior_bars_required, max_cross_bars=EMA_MAX_CROS
     if total == 0:
         return "insufficient_data", 0, 0
 
-    # Allow 1 cross bar — the pullback bar touching the EMA is valid
-    ALLOWED_CROSS = 1
-    if above_count >= prior_bars_required and below_count <= ALLOWED_CROSS:
+    # Zero cross tolerance — any bar on wrong side = mixed
+    if above_count >= prior_bars_required and below_count == 0:
         return "from_above", above_count, below_count
-    elif below_count >= prior_bars_required and above_count <= ALLOWED_CROSS:
+    elif below_count >= prior_bars_required and above_count == 0:
         return "from_below", above_count, below_count
     else:
         return "mixed", above_count, below_count
-
-
-def _candle_approach_direction(r, es, lookback=4):
-    """
-    Determine whether price is approaching the EMA from above or below
-    by analyzing the CHARACTER of the bars leading into the touch.
-
-    For a valid LONG pullback (approaching from above):
-    - The last 2-4 bars before the touch should show DECLINING closes
-      (price came down to the EMA — it was higher before)
-    - The open of the touch bar should be ABOVE or AT the EMA
-      (price opened above EMA and dipped to touch it, not surged up to it)
-    - There must be a prior swing high ABOVE the current EMA level
-      in the last 10 bars (price was up there and came back down)
-
-    For a false long (approaching from below):
-    - The bars leading to the touch show RISING closes (price surging up)
-    - The open of the touch bar is BELOW the EMA (opened below, trying to break through)
-    - No prior swing high above the EMA — price was never up there
-
-    Returns: "pullback_long", "pullback_short", or "false_approach"
-    """
-    if len(r) < lookback + 2 or len(es) < lookback + 2:
-        return "insufficient_data"
-
-    en = es[-1]
-    if en is None:
-        return "insufficient_data"
-
-    last = r[-1]
-    touch_bar_open = last["o"]
-
-    # Check 1: open of touch bar relative to EMA
-    # Valid long pullback: bar opened at or above EMA (came down to it)
-    # False approach from below: bar opened below EMA (surging up through it)
-    open_above_ema = touch_bar_open >= en * 0.997   # within 0.3% counts as "at"
-
-    # Check 2: character of preceding bars (were closes declining or rising?)
-    pre_bars = r[-(lookback + 1):-1]
-    if len(pre_bars) >= 2:
-        closes = [c["c"] for c in pre_bars]
-        # Declining closes = pullback character (good for long)
-        # Rising closes = approach from below character (bad for long, good for short entry)
-        net_change = closes[-1] - closes[0]
-        declining_approach = net_change < 0   # closes fell into the EMA
-        rising_approach    = net_change > 0   # closes rose into the EMA
-    else:
-        declining_approach = False
-        rising_approach    = False
-
-    # Check 3: prior swing high above EMA (was price up there before?)
-    # Look back 10 bars for a high significantly above the current EMA
-    prior_bars = r[-11:-1] if len(r) >= 11 else r[:-1]
-    prior_swing_high = max((c["h"] for c in prior_bars), default=0)
-    had_swing_high_above = prior_swing_high > en * 1.005   # at least 0.5% above EMA
-
-    # Classify
-    if open_above_ema and declining_approach and had_swing_high_above:
-        return "pullback_long"   # clean pullback from above — valid long
-    elif not open_above_ema and rising_approach and not had_swing_high_above:
-        return "false_approach"  # surging from below — false long signal
-    elif not open_above_ema and rising_approach:
-        return "false_approach"  # opened below EMA, rising into it
-    elif open_above_ema and rising_approach:
-        return "false_approach"  # opened above but rising = not a pullback, a continuation
-    else:
-        return "ambiguous"       # unclear — let other gates decide
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1185,12 +1086,6 @@ def _apply_quality_modifiers(score, rvol, rs_mod, rs_tier="?"):
     and won't fire. An "A+" counter-trend setup scoring 65 will land at
     ~80+ and fires as a high-confidence alert.
     """
-    # HARD GATE: RVOL near-zero means no session data exists yet (premarket or
-    # early session with no volume baseline). Not a penalty — a hard block.
-    # RVOL 0.0x or 0.01x appearing on alerts = meaningless data firing.
-    if rvol is not None and rvol < 0.1:
-        return 0   # force score to zero — will fail MIN_SCORE gate
-
     # RVOL modifier
     if rvol is None:
         score -= 5
@@ -1325,7 +1220,7 @@ def pmh_retest(c5, p, vw, pmh_v, rvol, rs_mod, rs_tier="?"):
     bars_since_break = len(r) - 2 - last_break_idx   # bars since the break
 
     # TIME GATE: break must have happened within 12 bars (~60 min)
-    if bars_since_break > 20:   # raised from 12 — 100min window
+    if bars_since_break > 12:
         return False, {}
 
     near       = abs(p - pmh_v) / pmh_v <= 0.004
@@ -1369,7 +1264,7 @@ def pml_retest(c5, p, vw, pml_v, rvol, rs_mod, rs_tier="?"):
         return False, {}
     last_break_idx   = break_bars[-1]
     bars_since_break = len(r) - 2 - last_break_idx
-    if bars_since_break > 20:   # raised from 12 — 100min window
+    if bars_since_break > 12:
         return False, {}
     near         = abs(p - pml_v) / pml_v <= 0.004
     below        = p <= pml_v * 1.002
@@ -1471,25 +1366,17 @@ def vwap_reject(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     """
     9 EMA pullback long — 5-minute bars.
-
-    QUALITY GATES (all must pass — these separate actionable from noise):
-
-    Gate 1 — VWAP: must be above VWAP. Hard gate.
-    Gate 2 — Direction: approached from above only. Hard gate.
-    Gate 3 — EMA slope: must be genuinely rising, not drifting.
-             Slope measured as % of price per bar. Flat EMA = ranging stock = skip.
-    Gate 4 — Touch count: max 2 EMA touches this session.
-             3+ touches = oscillating, not trending. COIN all day fails here.
-    Gate 5 — Volume dry-up on pullback: REQUIRED, not a bonus.
-             Active volume on pullback = sellers still present = not clean.
-    Gate 6 — Bounce bar quality: must close in top 40% of range AND
-             bar range >= 0.15% of price. Doji at EMA = indecision = skip.
+    HARD GATES (checked before anything else):
+    - Price must be ABOVE VWAP. Below VWAP = no long EMA setup, period.
+    - Price must have been ABOVE the EMA for prior bars (direction context).
+    Both conditions exist in the scoring logic but were not catching all
+    cases. Making them hard exits before any further evaluation.
     """
     r = rh(c5)
     if len(r) < 14:
         return False, {}
 
-    # GATE 1 — above VWAP
+    # HARD GATE 1 — must be above VWAP. Non-negotiable for longs.
     if vw and p <= vw:
         return False, {}
 
@@ -1499,79 +1386,37 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if en is None:
         return False, {}
 
-    # GATE 2 — direction context: approached from above (body-based)
+    # HARD GATE 2 — must have approached from above
     ctx, bars_above, bars_below = ema_position_context(r, es, EMA_PRIOR_BARS_5M)
     if ctx != "from_above":
         return False, {}
-    # Note: _candle_approach_direction removed — it incorrectly flagged valid
-    # uptrend pullbacks as "false_approach" when pre-bars showed rising closes
-    # (which is normal on a strong trend before the pullback bar)
 
-    # GATE 3 — EMA slope must be meaningful (0.03% of price per bar minimum)
-    # This kills flat/ranging stocks where EMA drifted up into price
-    ema_vals = [e for e in es[-6:] if e is not None]
-    if len(ema_vals) < 4:
-        return False, {}
-    slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 / len(ema_vals)
-    if slope_pct < 0.015:   # lowered from 0.03 — mature trends have lower slope
-        return False, {}
-
-    # GATE 4 — touch count: max 2 EMA touches this session
-    # Count how many times price got within 0.3% of EMA in the full session
-    touch_count = sum(
-        1 for i, (bar, ema_v) in enumerate(zip(r[:-1], es[:-1]))
-        if ema_v is not None and bar["l"] <= ema_v * 1.003
-    )
-    if touch_count > 3:   # raised — strong trends have 3+ valid pullbacks
-        return False, {}
-
+    ema_vals   = [e for e in es[-5:] if e is not None]
+    rising     = len(ema_vals) > 1 and ema_vals[-1] > ema_vals[0]
     last, prev = r[-1], r[-2]
-
-    # GATE 5 — volume check (score modifier, not hard gate)
-    # On strong trend days volume is elevated session-wide — a hard gate here
-    # blocks every EMA pullback on GOOGL/AAPL running all day.
-    # Score: dry-up = +10 bonus, elevated = no penalty (stock is just in play)
-    # Only block if volume is EXPANDING significantly on the pullback (sellers pushing)
-    _, _, vol_ratio = vol_baseline(c5)
-    vol_expanding_on_pb = vol_ratio is not None and vol_ratio > 1.50
-    light_pb            = vol_ratio is not None and vol_ratio <= 0.80
-
-    # Must be touching the EMA
-    touched = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
-    if not touched:
-        return False, {}
-
-    # GATE 6 — bounce bar quality: close in top 40% of range, real range
-    bar_range = last["h"] - last["l"]
-    min_range  = p * 0.0015   # 0.15% of price minimum range
-    close_pos  = (last["c"] - last["l"]) / bar_range if bar_range > 0 else 0
-    if bar_range < min_range or close_pos < 0.40:
-        return False, {}
-
-    # Block only if volume actively EXPANDING on pullback (sellers in control)
-    if vol_expanding_on_pb:
-        return False, {}
-
     above_vwap = p > (vw or 0)
-    rising     = slope_pct > 0
+    touched    = last["l"] <= en * 1.003 or prev["l"] <= en * 1.003
+    bouncing   = last["c"] > prev["h"] or last["c"] > en
+    _, _, vol_ratio = vol_baseline(c5)
+    light_pb   = vol_ratio is not None and vol_ratio <= 0.80
+
+    if not (rising and touched and bouncing):
+        return False, {}
 
     score = _apply_quality_modifiers(
-        68 + (8 if touch_count == 1 else 3) + (5 if above_vwap else 0)
-           + (10 if light_pb else 0) + (5 if rising else 0),
+        65 + (10 if light_pb else 0) + (10 if above_vwap else 0) + (5 if rising else 0),
         rvol, rs_mod
     )
     if score < MIN_SCORE:
         return False, {}
-
     return True, {
         "setup": "EMA9_5M_PULLBACK_LONG", "dir": "🟢 LONG",
-        "trigger": f"{'First' if touch_count == 1 else 'Second'} clean 9 EMA pullback from above",
+        "trigger": "Bounce after 9 EMA touch (from above)",
         "inval":   f"Loss of 9 EMA ${round(en, 2)}",
         "level":   f"9 EMA: ${round(en, 2)} | VWAP: ${round(vw, 2) if vw else 'N/A'}",
-        "vol":     f"Pullback dry ✅ vol ratio {round(vol_ratio,2)}x | RVOL {rvol}x",
+        "vol":     f"Pullback light ✅ RVOL {rvol}x" if light_pb else f"Watch RVOL {rvol}x",
         "score":   score, "action": "Actionable",
-        "notes":   (f"Touch #{touch_count} | EMA slope {round(slope_pct*100,1)}bp/bar | "
-                    f"Close pos: top {round(close_pos*100,0):.0f}%"),
+        "notes":   f"Rising EMA | {bars_above}b above / {bars_below}b below before touch",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
@@ -1579,15 +1424,13 @@ def ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier="?"):
 def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     """
     9 EMA pullback short — 5-minute bars.
-    Same quality gates as long version, inverted:
-    Gate 1: below VWAP. Gate 3: EMA slope falling 0.03%/bar min.
-    Gate 4: max 2 touches. Gate 5: vol dry-up required.
-    Gate 6: close in bottom 40% of range.
+    HARD GATE: price must be BELOW VWAP. Above VWAP = no short EMA setup.
     """
     r = rh(c5)
     if len(r) < 14:
         return False, {}
 
+    # HARD GATE — must be below VWAP for shorts
     if vw and p >= vw:
         return False, {}
 
@@ -1601,56 +1444,32 @@ def ema9_pb_short(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     if ctx != "from_below":
         return False, {}
 
-    ema_vals = [e for e in es[-6:] if e is not None]
-    if len(ema_vals) < 4:
-        return False, {}
-    slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 / len(ema_vals)
-    if slope_pct > -0.03:   # EMA must be falling at least 0.03%/bar
-        return False, {}
-
-    # Touch count — max 2
-    touch_count = sum(
-        1 for bar, ema_v in zip(r[:-1], es[:-1])
-        if ema_v is not None and bar["h"] >= ema_v * 0.997
-    )
-    if touch_count > 3:   # raised — strong trends have 3+ valid pullbacks
-        return False, {}
-
+    ema_vals  = [e for e in es[-5:] if e is not None]
+    falling   = len(ema_vals) > 1 and ema_vals[-1] < ema_vals[0]
     last, prev = r[-1], r[-2]
-
-    # Volume dry-up required
-    _, _, vol_ratio = vol_baseline(c5)
-    if vol_ratio is None or vol_ratio > 0.80:
-        return False, {}
-
-    touched   = last["h"] >= en * 0.997 or prev["h"] >= en * 0.997
-    if not touched:
-        return False, {}
-
-    # Rejection bar: close in bottom 40% of range
-    bar_range = last["h"] - last["l"]
-    min_range  = p * 0.0015
-    close_pos  = (last["c"] - last["l"]) / bar_range if bar_range > 0 else 1
-    if bar_range < min_range or close_pos > 0.60:
-        return False, {}
-
     below_vwap = p < (vw or float("inf"))
+    touched    = last["h"] >= en * 0.997 or prev["h"] >= en * 0.997
+    rejecting  = last["c"] < last["o"] and last["c"] < en
+    _, _, vol_ratio = vol_baseline(c5)
+    light_bounce = vol_ratio is not None and vol_ratio <= 0.80
+
+    if not (falling and touched and rejecting):
+        return False, {}
+
     score = _apply_quality_modifiers(
-        68 + (8 if touch_count == 1 else 3) + (5 if below_vwap else 0),
+        65 + (10 if light_bounce else 0) + (10 if below_vwap else 0) + (5 if falling else 0),
         rvol, -rs_mod
     )
     if score < MIN_SCORE:
         return False, {}
-
     return True, {
         "setup": "EMA9_5M_PULLBACK_SHORT", "dir": "🔴 SHORT",
-        "trigger": f"{'First' if touch_count == 1 else 'Second'} clean 9 EMA rejection from below",
+        "trigger": f"Break below ${round(prev['l'], 2)} after EMA rejection (from below)",
         "inval":   f"Reclaim through 9 EMA ${round(en, 2)}",
         "level":   f"9 EMA resistance: ${round(en, 2)}",
-        "vol":     f"Bounce dry ✅ vol ratio {round(vol_ratio,2)}x | RVOL {rvol}x",
+        "vol":     f"Bounce light ✅ RVOL {rvol}x" if light_bounce else f"Watch RVOL {rvol}x",
         "score":   score, "action": "Actionable",
-        "notes":   (f"Touch #{touch_count} | EMA slope {round(slope_pct*100,1)}bp/bar | "
-                    f"Close pos: bot {round((1-close_pos)*100,0):.0f}%"),
+        "notes":   f"Falling EMA | {bars_below}b below / {bars_above}b above before bounce",
         "trigger_bar_ts": _trigger_bar(r),
     }
 
@@ -2084,14 +1903,14 @@ def later_day_hod_breakout(c5, p, vw, rvol, rs_mod, rs_tier="?"):
     # FRESHNESS GATE: HOD must have been set within last 10 bars (~50 min)
     # If HOD was set 20 bars ago and price has been below it since, it's stale
     bars_since_hod = len(prior_bars) - 1 - hod_idx
-    if bars_since_hod > 20:   # raised — allow 100min consolidation before break
+    if bars_since_hod > 10:
         return False, {}
 
     # BASE GATE: at least 3 of last 5 bars (before current) must be below HOD
     # This confirms a real base was built, not just a single dip and pop
     base_check_bars = r[-6:-1]
     bars_below_hod  = sum(1 for c in base_check_bars if c["h"] <= hod_val * 1.002)
-    if bars_below_hod < 1:   # lowered — just need 1 pause bar below HOD
+    if bars_below_hod < 3:
         return False, {}
 
     # BREAK GATE: current bar must be breaking above HOD
@@ -3177,610 +2996,6 @@ def hitchhiker_scalp_long(c5, c1, p, vw, pmh_v, pdh, rvol, rs_mod, rs_tier="?", 
     }
 
 
-def _opening_impulse_stats(r2, atr21):
-    """
-    Measure the opening impulse on 2-min bars.
-    Returns dict with:
-      impulse_pct_atr  — move from open as % of 21-day ATR (0.65 = 65% of ATR)
-      impulse_bars     — how many bars the initial drive took
-      impulse_dir      — "long" or "short"
-      impulse_high     — highest price in the impulse leg
-      impulse_low      — lowest price in the impulse leg
-      compression_pct  — recent consolidation range as % of impulse range
-      vol_phase        — "impulse" / "compression" / "reexpanding"
-
-    We look at the first 15 bars (30 min on 2-min) for the impulse.
-    The compression is detected in the subsequent bars before the EMA touch.
-    """
-    if not r2 or not atr21 or atr21 == 0:
-        return None
-
-    open_price  = r2[0]["o"]
-    first15     = r2[:15]   # first 30 minutes on 2-min bars
-    session_h   = max(c["h"] for c in first15)
-    session_l   = min(c["l"] for c in first15)
-
-    # Determine direction — which way did the impulse go
-    up_move   = session_h - open_price
-    down_move = open_price - session_l
-    if up_move >= down_move:
-        impulse_dir   = "long"
-        impulse_size  = up_move
-        impulse_high  = session_h
-        impulse_low   = open_price
-    else:
-        impulse_dir   = "short"
-        impulse_size  = down_move
-        impulse_high  = open_price
-        impulse_low   = session_l
-
-    # Impulse as fraction of 21-day ATR
-    impulse_pct_atr = impulse_size / atr21
-
-    # Find how many bars the impulse took (first bar where extreme was reached)
-    impulse_bars = 1
-    if impulse_dir == "long":
-        for i, c in enumerate(first15):
-            if c["h"] >= session_h * 0.99:
-                impulse_bars = i + 1
-                break
-    else:
-        for i, c in enumerate(first15):
-            if c["l"] <= session_l * 1.01:
-                impulse_bars = i + 1
-                break
-
-    # Compression: look at bars AFTER the impulse up to the current bar
-    post_impulse = r2[impulse_bars:]
-    if len(post_impulse) >= 3:
-        comp_bars  = post_impulse[-6:]   # last 6 bars as compression window
-        comp_h     = max(c["h"] for c in comp_bars)
-        comp_l     = min(c["l"] for c in comp_bars)
-        comp_range = comp_h - comp_l
-        comp_pct   = comp_range / impulse_size if impulse_size > 0 else 1.0
-    else:
-        comp_pct = 1.0
-
-    # Volume phase: compare recent bars to impulse bars
-    impulse_vol  = sum(c["v"] for c in r2[:impulse_bars]) / max(impulse_bars, 1)
-    recent_vol   = sum(c["v"] for c in r2[-4:]) / 4 if len(r2) >= 4 else impulse_vol
-    vol_ratio    = recent_vol / impulse_vol if impulse_vol > 0 else 1.0
-
-    if vol_ratio < 0.45:
-        vol_phase = "compression"     # deep compression — best setup condition
-    elif vol_ratio < 0.70:
-        vol_phase = "light"           # light volume — still good
-    elif vol_ratio > 1.20:
-        vol_phase = "reexpanding"     # volume coming back — potential next leg
-    else:
-        vol_phase = "normal"
-
-    return {
-        "impulse_pct_atr": round(impulse_pct_atr, 2),
-        "impulse_bars":    impulse_bars,
-        "impulse_dir":     impulse_dir,
-        "impulse_high":    round(impulse_high, 2),
-        "impulse_low":     round(impulse_low, 2),
-        "impulse_size":    round(impulse_size, 2),
-        "compression_pct": round(comp_pct, 2),
-        "vol_phase":       vol_phase,
-        "vol_ratio":       round(vol_ratio, 2),
-    }
-
-
-def ema9_2m_first_pullback_long(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod, rs_tier="?"):
-    """
-    2-Minute 9 EMA First/Second Pullback Long — A+ Setup.
-
-    The AAOI / INTC / TSLA setup. A stock makes a strong opening impulse
-    (60%+ of its 21-day ATR in the first 30 minutes), then compresses
-    sideways while the 9 EMA catches up from below. The first or second
-    touch of that rising 9 EMA is the golden entry.
-
-    What separates this from noise:
-    1. The 21-day ATR gate: MUST have moved 60%+ of daily ATR in first 30 min
-       (not hard 75% — 60% minimum, scores better at 80%+)
-    2. Compression: post-impulse bars must be tight (< 35% of impulse range)
-       This is the "sideways/halted" condition you described
-    3. EMA stack: 9 EMA above 21 EMA, both rising (not just 9 EMA)
-    4. Volume phase: compression is good (dry-up after impulse = accumulation)
-       Re-expansion is also valid (next leg starting)
-    5. First touch = A+ (10pt bonus), Second touch = A (5pt bonus), max 2
-    6. 5-min alignment: 5-min EMA also rising
-    """
-    r2 = rh(c2)
-    r5 = rh(c5)
-    if len(r2) < 10 or len(r5) < 5:
-        return False, {}
-
-    # Above VWAP gate
-    if vw and p <= vw:
-        return False, {}
-
-    # ── GATE 1: Opening impulse must be 60%+ of 21-day ATR ──
-    stats = _opening_impulse_stats(r2, atr21)
-    if stats is None:
-        return False, {}
-    if stats["impulse_dir"] != "long":
-        return False, {}   # short impulse — wrong direction
-    if stats["impulse_pct_atr"] < 0.60:
-        return False, {}   # move too small — not a genuine in-play stock
-
-    # ── GATE 2: Compression after impulse ──
-    # Post-impulse bars must be tight — stock is digesting, not reversing
-    # Allow up to 35% of impulse range as consolidation width
-    if stats["compression_pct"] > 0.35:
-        return False, {}   # giving back too much = not a clean compression
-
-    # ── GATE 3: 2-min EMA9 slope — must be genuinely rising ──
-    cls2 = [c["c"] for c in r2]
-    es2  = ema_series(cls2, 9)
-    en2  = es2[-1]
-    if en2 is None:
-        return False, {}
-    ema_vals2 = [e for e in es2[-6:] if e is not None]
-    if len(ema_vals2) < 4:
-        return False, {}
-    slope_pct = (ema_vals2[-1] - ema_vals2[0]) / ema_vals2[0] * 100 / len(ema_vals2)
-    if slope_pct < 0.04:
-        return False, {}
-
-    # ── GATE 4: EMA stack — 9 EMA must be above 21 EMA (both rising) ──
-    es21 = ema_series(cls2, 21)
-    en21 = es21[-1] if es21 else None
-    if en21 is None:
-        return False, {}
-    ema21_vals = [e for e in es21[-4:] if e is not None]
-    ema21_rising = len(ema21_vals) >= 2 and ema21_vals[-1] > ema21_vals[0]
-    ema_stacked  = en2 > en21   # 9 above 21 = bullish stack
-    if not (ema_stacked and ema21_rising):
-        return False, {}
-
-    # ── GATE 5: Direction — approached from above (body-based) ──
-    ctx2, bars_above2, _ = ema_position_context(r2, es2, 4)
-    if ctx2 != "from_above":
-        return False, {}
-
-
-    # ── GATE 6: Touch count — first or second only ──
-    touch_count = sum(
-        1 for bar, ema_v in zip(r2[:-1], es2[:-1])
-        if ema_v is not None and bar["l"] <= ema_v * 1.003
-    )
-    if touch_count > 2:
-        return False, {}
-
-    # ── GATE 7: Currently touching the EMA ──
-    last2, prev2 = r2[-1], r2[-2]
-    touched = last2["l"] <= en2 * 1.003 or prev2["l"] <= en2 * 1.003
-    if not touched:
-        return False, {}
-
-    # ── GATE 8: Volume phase — compression or re-expanding both valid ──
-    vol_phase = stats["vol_phase"]
-    if vol_phase == "normal" and stats["vol_ratio"] > 0.90:
-        # Volume hasn't compressed enough — sellers still active
-        return False, {}
-
-    # ── GATE 9: Bounce bar quality ──
-    bar_range = last2["h"] - last2["l"]
-    min_range  = p * 0.001
-    close_pos  = (last2["c"] - last2["l"]) / bar_range if bar_range > 0 else 0
-    if bar_range < min_range or close_pos < 0.35:
-        return False, {}
-
-    # ── GATE 10: 5-min alignment ──
-    cls5       = [c["c"] for c in r5]
-    es5        = ema_series(cls5, 9)
-    ema5_vals  = [e for e in es5[-4:] if e is not None]
-    ema5_rising = len(ema5_vals) >= 2 and ema5_vals[-1] > ema5_vals[0]
-    if not ema5_rising:
-        return False, {}
-
-    # ── SCORE ──
-    first_touch    = touch_count == 1
-    impulse_pct    = stats["impulse_pct_atr"]
-    vol_bonus      = 8 if vol_phase == "compression" else (5 if vol_phase == "light" else 3)
-    impulse_bonus  = 10 if impulse_pct >= 0.90 else (7 if impulse_pct >= 0.75 else 4)
-    stack_bonus    = 6   # EMA stack confirmed
-
-    base  = 72
-    score = base
-    score += 12 if first_touch else 5
-    score += impulse_bonus
-    score += vol_bonus
-    score += stack_bonus
-    score += 5 if close_pos >= 0.55 else 0
-    score += rs_mod
-    score += time_of_day_modifier()
-
-    if rs_tier in ("C", "D"):
-        return False, {}
-
-    if rvol and rvol >= 3.0:
-        score += 8
-    elif rvol and rvol >= RVOL_MIN:
-        score += 3
-    elif rvol and rvol < 0.1:
-        return False, {}
-
-    score = clamp_score(score)
-    if score < MIN_SCORE:
-        return False, {}
-
-    gap = None
-    if prior_close and r5:
-        gap = round((r5[0]["o"] - prior_close) / prior_close * 100, 1)
-
-    touch_label = "🥇 FIRST" if first_touch else "🥈 SECOND"
-
-    return True, {
-        "setup":   "EMA9_2M_FIRST_PULLBACK_LONG",
-        "dir":     "🟢 LONG",
-        "trigger": (f"{touch_label} clean 2-min 9 EMA pullback | "
-                    f"Opening impulse: {round(impulse_pct*100,0):.0f}% of ATR | "
-                    f"Vol: {vol_phase}"),
-        "inval":   f"Loss of 2-min 9 EMA ${round(en2, 2)}",
-        "level":   (f"2m EMA9: ${round(en2, 2)} | 2m EMA21: ${round(en21, 2)} | "
-                    f"VWAP: ${round(vw, 2) if vw else 'N/A'} | "
-                    f"Gap: {f'+{gap}%' if gap else 'N/A'}"),
-        "vol":     (f"Vol phase: {vol_phase} ({round(stats['vol_ratio']*100,0):.0f}% of impulse vol) | "
-                    f"RVOL {rvol}x"),
-        "score":   score,
-        "action":  "Enter on bounce confirmation — don't wait for bar close",
-        "notes":   (f"Impulse: ${stats['impulse_size']} ({round(impulse_pct*100,0):.0f}% ATR) in "
-                    f"{stats['impulse_bars']} bars | "
-                    f"Compression: {round(stats['compression_pct']*100,0):.0f}% of impulse | "
-                    f"EMA stack ✅ | Slope {round(slope_pct*100,1)}bp/bar"),
-        "trigger_bar_ts": _trigger_bar(r2),
-    }
-
-
-def ema9_2m_first_pullback_short(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod, rs_tier="?"):
-    """
-    2-Minute 9 EMA First/Second Pullback Short — A+ Setup.
-
-    The QCOM setup. Stock cascades down 60%+ of ATR in first 30 min,
-    compresses sideways, 9 EMA descending catches down toward price.
-    First bounce INTO the declining 9 EMA from below that gets rejected
-    = golden short entry.
-
-    EMA stack inverted: 9 EMA below 21 EMA (bearish stack), both declining.
-    Price below both. First bounce into 9 EMA = rejection = short.
-    """
-    r2 = rh(c2)
-    r5 = rh(c5)
-    if len(r2) < 10 or len(r5) < 5:
-        return False, {}
-
-    # Below VWAP gate
-    if vw and p >= vw:
-        return False, {}
-
-    # Opening impulse must be downward 60%+ of ATR
-    stats = _opening_impulse_stats(r2, atr21)
-    if stats is None:
-        return False, {}
-    if stats["impulse_dir"] != "short":
-        return False, {}
-    if stats["impulse_pct_atr"] < 0.60:
-        return False, {}
-
-    # Compression
-    if stats["compression_pct"] > 0.35:
-        return False, {}
-
-    # 2-min EMA9 slope — must be declining
-    cls2 = [c["c"] for c in r2]
-    es2  = ema_series(cls2, 9)
-    en2  = es2[-1]
-    if en2 is None:
-        return False, {}
-    ema_vals2 = [e for e in es2[-6:] if e is not None]
-    if len(ema_vals2) < 4:
-        return False, {}
-    slope_pct = (ema_vals2[-1] - ema_vals2[0]) / ema_vals2[0] * 100 / len(ema_vals2)
-    if slope_pct > -0.04:   # must be declining at least 0.04%/bar
-        return False, {}
-
-    # EMA stack: 9 below 21, both declining (bearish stack)
-    es21 = ema_series(cls2, 21)
-    en21 = es21[-1] if es21 else None
-    if en21 is None:
-        return False, {}
-    ema21_vals   = [e for e in es21[-4:] if e is not None]
-    ema21_falling = len(ema21_vals) >= 2 and ema21_vals[-1] < ema21_vals[0]
-    ema_stacked   = en2 < en21   # 9 below 21 = bearish stack
-    if not (ema_stacked and ema21_falling):
-        return False, {}
-
-    # Direction — approached from below (body-based)
-    ctx2, _, bars_below2 = ema_position_context(r2, es2, 4)
-    if ctx2 != "from_below":
-        return False, {}
-
-
-    # Touch count — first or second only
-    touch_count = sum(
-        1 for bar, ema_v in zip(r2[:-1], es2[:-1])
-        if ema_v is not None and bar["h"] >= ema_v * 0.997
-    )
-    if touch_count > 2:
-        return False, {}
-
-    # Currently touching the EMA
-    last2, prev2 = r2[-1], r2[-2]
-    touched = last2["h"] >= en2 * 0.997 or prev2["h"] >= en2 * 0.997
-    if not touched:
-        return False, {}
-
-    # Volume phase
-    vol_phase = stats["vol_phase"]
-    if vol_phase == "normal" and stats["vol_ratio"] > 0.90:
-        return False, {}
-
-    # Rejection bar quality: close in bottom 40%
-    bar_range = last2["h"] - last2["l"]
-    min_range  = p * 0.001
-    close_pos  = (last2["c"] - last2["l"]) / bar_range if bar_range > 0 else 1
-    if bar_range < min_range or close_pos > 0.60:
-        return False, {}
-
-    # 5-min alignment — EMA9 must be declining on 5-min
-    cls5       = [c["c"] for c in r5]
-    es5        = ema_series(cls5, 9)
-    ema5_vals  = [e for e in es5[-4:] if e is not None]
-    ema5_falling = len(ema5_vals) >= 2 and ema5_vals[-1] < ema5_vals[0]
-    if not ema5_falling:
-        return False, {}
-
-    first_touch   = touch_count == 1
-    impulse_pct   = stats["impulse_pct_atr"]
-    vol_bonus     = 8 if vol_phase == "compression" else (5 if vol_phase == "light" else 3)
-    impulse_bonus = 10 if impulse_pct >= 0.90 else (7 if impulse_pct >= 0.75 else 4)
-
-    base  = 72
-    score = base
-    score += 12 if first_touch else 5
-    score += impulse_bonus
-    score += vol_bonus
-    score += 6   # EMA stack
-    score += 5 if close_pos <= 0.35 else 0
-    score += rs_mod
-    score += time_of_day_modifier()
-
-    if rs_tier in ("C", "D"):
-        return False, {}
-
-    if rvol and rvol >= 3.0:
-        score += 8
-    elif rvol and rvol >= RVOL_MIN:
-        score += 3
-    elif rvol and rvol < 0.1:
-        return False, {}
-
-    score = clamp_score(score)
-    if score < MIN_SCORE:
-        return False, {}
-
-    touch_label = "🥇 FIRST" if first_touch else "🥈 SECOND"
-
-    return True, {
-        "setup":   "EMA9_2M_FIRST_PULLBACK_SHORT",
-        "dir":     "🔴 SHORT",
-        "trigger": (f"{touch_label} 2-min 9 EMA rejection | "
-                    f"Opening cascade: {round(impulse_pct*100,0):.0f}% of ATR | "
-                    f"Vol: {vol_phase}"),
-        "inval":   f"Reclaim above 2-min 9 EMA ${round(en2, 2)}",
-        "level":   (f"2m EMA9: ${round(en2, 2)} | 2m EMA21: ${round(en21, 2)} | "
-                    f"VWAP: ${round(vw, 2) if vw else 'N/A'}"),
-        "vol":     (f"Vol phase: {vol_phase} ({round(stats['vol_ratio']*100,0):.0f}% of impulse vol) | "
-                    f"RVOL {rvol}x"),
-        "score":   score,
-        "action":  "Enter on rejection confirmation — aggressive",
-        "notes":   (f"Cascade: ${stats['impulse_size']} ({round(impulse_pct*100,0):.0f}% ATR) in "
-                    f"{stats['impulse_bars']} bars | "
-                    f"EMA bearish stack ✅ | Slope {round(slope_pct*100,1)}bp/bar"),
-        "trigger_bar_ts": _trigger_bar(r2),
-    }
-
-
-def ema_stack_momentum_long(c2, c5, p, vw, atr21, rvol, rs_mod, rs_tier="?"):
-    """
-    EMA Stack Momentum Long — Sustained Drive Alert.
-
-    AAOI / TSLA type. Stock has been trending up for multiple bars with:
-    - Price ABOVE both 9 EMA and 21 EMA (bullish stack)
-    - Both EMAs steeply rising
-    - Stock has moved significantly today (in play)
-    - Making new session highs or near them
-
-    This fires for continuation of the trend, not a pullback entry.
-    It catches the "momentum is running, options are expanding" moment.
-    Alert once when stack confirms, re-fires only on new session high.
-    """
-    r2 = rh(c2)
-    r5 = rh(c5)
-    if len(r2) < 15 or len(r5) < 8:
-        return False, {}
-
-    if vw and p <= vw:
-        return False, {}
-
-    cls2 = [c["c"] for c in r2]
-    es2  = ema_series(cls2, 9)
-    es21 = ema_series(cls2, 21)
-    en2  = es2[-1]
-    en21 = es21[-1]
-    if en2 is None or en21 is None:
-        return False, {}
-
-    # Price above BOTH EMAs
-    if not (p > en2 and p > en21):
-        return False, {}
-
-    # Bullish stack: 9 above 21
-    if en2 <= en21:
-        return False, {}
-
-    # Both EMAs must be rising steeply
-    ema9_vals  = [e for e in es2[-6:]  if e is not None]
-    ema21_vals = [e for e in es21[-6:] if e is not None]
-    if len(ema9_vals) < 4 or len(ema21_vals) < 4:
-        return False, {}
-
-    slope9  = (ema9_vals[-1]  - ema9_vals[0])  / ema9_vals[0]  * 100 / len(ema9_vals)
-    slope21 = (ema21_vals[-1] - ema21_vals[0]) / ema21_vals[0] * 100 / len(ema21_vals)
-
-    if slope9 < 0.05 or slope21 < 0.02:
-        return False, {}
-
-    # Stock must have moved 60%+ of ATR today
-    if atr21 and atr21 > 0:
-        open_price = r2[0]["o"]
-        session_h  = max(c["h"] for c in r2)
-        move_pct   = (session_h - open_price) / atr21
-        if move_pct < 0.60:
-            return False, {}
-    else:
-        return False, {}
-
-    # Price near session high (within 2%) — still at the top, not fading
-    session_high = max(c["h"] for c in r2)
-    if p < session_high * 0.98:
-        return False, {}
-
-    # Multiple bars (at least 6) with price above BOTH EMAs — sustained trend
-    bars_in_stack = sum(
-        1 for bar, e9, e21 in zip(r2[-10:], es2[-10:], es21[-10:])
-        if e9 is not None and e21 is not None and bar["c"] > e9 and bar["c"] > e21
-    )
-    if bars_in_stack < 6:
-        return False, {}
-
-    score = 70
-    score += 10 if slope9 >= 0.10 else (5 if slope9 >= 0.05 else 0)
-    score += 8  if move_pct >= 1.0 else (5 if move_pct >= 0.75 else 2)
-    score += 8  if rvol and rvol >= 3.0 else (4 if rvol and rvol >= RVOL_MIN else 0)
-    score += rs_mod
-    score += time_of_day_modifier()
-
-    if rs_tier in ("C", "D"):
-        return False, {}
-
-    score = clamp_score(score)
-    if score < MIN_SCORE:
-        return False, {}
-
-    return True, {
-        "setup":   "EMA_STACK_MOMENTUM_LONG",
-        "dir":     "🟢 LONG",
-        "trigger": (f"Bullish EMA stack — price above 9 & 21 EMA, both rising | "
-                    f"Move: {round(move_pct*100,0):.0f}% of ATR"),
-        "inval":   f"Close below 2-min 9 EMA ${round(en2, 2)} on expanding volume",
-        "level":   (f"2m EMA9: ${round(en2, 2)} | 2m EMA21: ${round(en21, 2)} | "
-                    f"Session HOD: ${round(session_high, 2)}"),
-        "vol":     f"RVOL {rvol}x | Stack bars: {bars_in_stack}",
-        "score":   score,
-        "action":  "Trend in play — options expanding, consider calls",
-        "notes":   (f"EMA9 slope {round(slope9*100,1)}bp/bar | "
-                    f"EMA21 slope {round(slope21*100,1)}bp/bar | "
-                    f"{bars_in_stack} bars in stack"),
-        "trigger_bar_ts": _trigger_bar(r2),
-    }
-
-
-def ema_stack_momentum_short(c2, c5, p, vw, atr21, rvol, rs_mod, rs_tier="?"):
-    """
-    EMA Stack Momentum Short — QCOM cascade type.
-
-    Price BELOW both 9 EMA and 21 EMA. Both declining steeply.
-    9 EMA below 21 EMA (bearish stack). Stock has cascaded 60%+ of ATR.
-    Near session lows. Options (puts) expanding.
-    """
-    r2 = rh(c2)
-    r5 = rh(c5)
-    if len(r2) < 15 or len(r5) < 8:
-        return False, {}
-
-    if vw and p >= vw:
-        return False, {}
-
-    cls2 = [c["c"] for c in r2]
-    es2  = ema_series(cls2, 9)
-    es21 = ema_series(cls2, 21)
-    en2  = es2[-1]
-    en21 = es21[-1]
-    if en2 is None or en21 is None:
-        return False, {}
-
-    if not (p < en2 and p < en21):
-        return False, {}
-    if en2 >= en21:   # need bearish stack: 9 below 21
-        return False, {}
-
-    ema9_vals  = [e for e in es2[-6:]  if e is not None]
-    ema21_vals = [e for e in es21[-6:] if e is not None]
-    if len(ema9_vals) < 4 or len(ema21_vals) < 4:
-        return False, {}
-
-    slope9  = (ema9_vals[-1]  - ema9_vals[0])  / ema9_vals[0]  * 100 / len(ema9_vals)
-    slope21 = (ema21_vals[-1] - ema21_vals[0]) / ema21_vals[0] * 100 / len(ema21_vals)
-
-    if slope9 > -0.05 or slope21 > -0.02:
-        return False, {}
-
-    if atr21 and atr21 > 0:
-        open_price = r2[0]["o"]
-        session_l  = min(c["l"] for c in r2)
-        move_pct   = (open_price - session_l) / atr21
-        if move_pct < 0.60:
-            return False, {}
-    else:
-        return False, {}
-
-    session_low = min(c["l"] for c in r2)
-    if p > session_low * 1.02:
-        return False, {}
-
-    bars_in_stack = sum(
-        1 for bar, e9, e21 in zip(r2[-10:], es2[-10:], es21[-10:])
-        if e9 is not None and e21 is not None and bar["c"] < e9 and bar["c"] < e21
-    )
-    if bars_in_stack < 6:
-        return False, {}
-
-    score = 70
-    score += 10 if abs(slope9) >= 0.10 else (5 if abs(slope9) >= 0.05 else 0)
-    score += 8  if move_pct >= 1.0 else (5 if move_pct >= 0.75 else 2)
-    score += 8  if rvol and rvol >= 3.0 else (4 if rvol and rvol >= RVOL_MIN else 0)
-    score += rs_mod
-    score += time_of_day_modifier()
-
-    if rs_tier in ("C", "D"):
-        return False, {}
-
-    score = clamp_score(score)
-    if score < MIN_SCORE:
-        return False, {}
-
-    return True, {
-        "setup":   "EMA_STACK_MOMENTUM_SHORT",
-        "dir":     "🔴 SHORT",
-        "trigger": (f"Bearish EMA stack — price below 9 & 21 EMA, both declining | "
-                    f"Cascade: {round(move_pct*100,0):.0f}% of ATR"),
-        "inval":   f"Close above 2-min 9 EMA ${round(en2, 2)} on expanding volume",
-        "level":   (f"2m EMA9: ${round(en2, 2)} | 2m EMA21: ${round(en21, 2)} | "
-                    f"Session LOD: ${round(session_low, 2)}"),
-        "vol":     f"RVOL {rvol}x | Stack bars: {bars_in_stack}",
-        "score":   score,
-        "action":  "Trend in play — puts expanding, institutional cascade",
-        "notes":   (f"EMA9 slope {round(slope9*100,1)}bp/bar | "
-                    f"EMA21 slope {round(slope21*100,1)}bp/bar | "
-                    f"{bars_in_stack} bars in bearish stack"),
-        "trigger_bar_ts": _trigger_bar(r2),
-    }
-
 def sweep_watch_long_v2(c2, p, vw):
     r = rh(c2)
     if len(r) < 8:
@@ -3992,8 +3207,6 @@ class Scanner:
         self.armed  = set(saved_armed if isinstance(saved_armed, list) else [])
 
         self.pmh, self.pml, self.pr = {}, {}, {}
-        self.datr    = {}   # 21-day ATR per ticker — refreshed once per day
-        self.datr_dt = None
         self.pm_dt, self.pr_dt      = None, None
         self.earnings               = set()
         self.fired_signals          = {}
@@ -4055,12 +3268,6 @@ class Scanner:
                 self.pr[t] = prior_day(t)
                 time.sleep(0.35)
             self.pr_dt = today
-        if self.datr_dt != today:
-            print("[SCAN] Refreshing 21-day ATR...")
-            for t in self.wl:
-                self.datr[t] = daily_atr21(t)
-                time.sleep(0.35)
-            self.datr_dt = today
 
     def refresh_spy(self):
         """
@@ -4160,20 +3367,12 @@ class Scanner:
     def scan_standard(self, ticker):
         candidates = []
         try:
-            # HARD GATE: do not fire any setup alerts before 9:30 ET.
-            # is_mkt() opens at 9:25 for daily reset purposes but trading
-            # setups require a full regular-hours session to be open.
-            if not hhmm_gte(now_et(), 9, 30):
-                return candidates
-
             c5_raw  = candles(ticker, 5)
             c1_raw  = candles(ticker, 1)
             c10_raw = candles(ticker, 10)
-            c2_raw  = candles(ticker, 2)   # 2-min bars for first-pullback setup
             c5      = closed_only(c5_raw,  5)
             c1      = closed_only(c1_raw,  1)
             c10     = closed_only(c10_raw, 10)
-            c2      = closed_only(c2_raw,  2)
             if not c5 or not c1:
                 return candidates
             # Mark that data loaded — used by API health monitor
@@ -4190,9 +3389,7 @@ class Scanner:
             pd          = self.pr.get(ticker, {})
             pdh         = pd.get("h")
             pdl         = pd.get("l")
-            prior_close = pd.get("c")
-            atr21       = self.datr.get(ticker)   # 21-day ATR for impulse detection
-            atr21       = self.datr.get(ticker)   # 21-day ATR for impulse detection
+            prior_close = pd.get("c")   # prior day close — used for gap detection
 
             # Quality inputs — computed once per ticker
             # Pass prior_close so calc_rvol can detect gap days and adjust baseline
@@ -4225,14 +3422,6 @@ class Scanner:
                  lambda: vwap_reclaim(c5, p, vw, rvol, rs_mod, rs_tier)),
                 ("EMA9_5M_PULLBACK_LONG",
                  lambda: ema9_pb_long(c5, p, vw, rvol, rs_mod, rs_tier)),
-                ("EMA9_2M_FIRST_PULLBACK_LONG",
-                 lambda: ema9_2m_first_pullback_long(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod, rs_tier)),
-                ("EMA9_2M_FIRST_PULLBACK_SHORT",
-                 lambda: ema9_2m_first_pullback_short(c2, c5, p, vw, prior_close, atr21, rvol, rs_mod_short, rs_tier_short)),
-                ("EMA_STACK_MOMENTUM_LONG",
-                 lambda: ema_stack_momentum_long(c2, c5, p, vw, atr21, rvol, rs_mod, rs_tier)),
-                ("EMA_STACK_MOMENTUM_SHORT",
-                 lambda: ema_stack_momentum_short(c2, c5, p, vw, atr21, rvol, rs_mod_short, rs_tier_short)),
                 ("EMA9_10M_PULLBACK_LONG",
                  lambda: ema9_pb_long_10m(c10, p, vw, rvol, rs_mod, rs_tier) if c10 else (False, {})),
                 ("EMA4_10M_RIDER_LONG",
