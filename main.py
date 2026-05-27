@@ -51,15 +51,17 @@ REFIRE_MINUTES   = 30       # confirmed move refire window
 
 # Dollar volume minimums per tier (filters thin tape)
 MIN_DOLLAR_VOL_T1 = 10_000_000   # $10M per 2-min bar  — core names
-MIN_DOLLAR_VOL_T2 = 20_000_000   # $20M per 5-min bar  — extended names
+MIN_DOLLAR_VOL_T2 = 50_000_000   # $50M per 5-min bar  — extended must show serious size
 
-# ATR velocity thresholds
-VELOCITY_PCT_T1  = 0.25   # 25% of ATR in 3 bars (6 min) fires on core
-VELOCITY_PCT_T2  = 0.30   # 30% of ATR in 3 bars (15 min) fires on extended
+# ATR velocity thresholds — Tier 2 must move TWICE as hard to alert
+VELOCITY_PCT_T1  = 0.25   # 25% of ATR in 3 bars — core
+VELOCITY_PCT_T2  = 0.50   # 50% of ATR in 3 bars — extended only on real momentum
 
-# Volume surge multipliers
-VOL_HIST_MULT    = 2.0    # vs historical avg bar volume
-VOL_SESSION_MULT = 1.8    # vs today's own session avg (catches second surges)
+# Volume surge multipliers — completely separate per tier
+VOL_HIST_MULT_T1    = 2.0    # core: 2x historical avg fires
+VOL_HIST_MULT_T2    = 4.0    # extended: 4x historical — needs real institutional energy
+VOL_SESSION_MULT_T1 = 1.8    # core: 1.8x today's session avg fires
+VOL_SESSION_MULT_T2 = 3.0    # extended: 3x today's session avg — eliminates routine bumps
 
 # ─────────────────────────────────────────────────────────────
 # TIER 1 — CORE WATCHLIST  (2-min precision, always scanned)
@@ -71,6 +73,8 @@ CORE_WATCHLIST = [
     "AVGO", "QCOM", "MU", "INTC", "ARM", "MRVL", "AAOI",
     # High-beta momentum names
     "PLTR", "DELL", "RKLB",
+    # New additions
+    "CRWV", "NBIS", "CSCO", "SNDK", "TSM", "NFLX", "ASTS",
     # Index ETFs
     "SPY", "QQQ",
 ]
@@ -384,18 +388,23 @@ def analyze_volume(cur_bar, rh_session_bars, hist_avg_bar_vol, price):
 
 def volume_is_surging(vol_data, tier=1):
     """
-    Returns True if volume qualifies as a surge.
-    Does NOT hard-gate — caller decides what to do with the signal.
-    Both conditions should be met for strongest signal; either alone still noted.
+    Tier 1 (core): either hist OR session surge triggers — lower bar, faster alerts.
+    Tier 2 (extended): BOTH hist AND session must surge, at higher multipliers.
+    Dollar volume minimum also much higher for Tier 2.
     """
     min_dollar = MIN_DOLLAR_VOL_T1 if tier == 1 else MIN_DOLLAR_VOL_T2
     if vol_data["dollar_vol"] < min_dollar:
-        return False   # absolute size filter — eliminates thin tape only
+        return False
 
-    hist_surge    = vol_data["vs_hist"]    and vol_data["vs_hist"]    >= VOL_HIST_MULT
-    session_surge = vol_data["vs_session"] and vol_data["vs_session"] >= VOL_SESSION_MULT
-
-    return hist_surge or session_surge   # either baseline triggers
+    if tier == 1:
+        hist_surge    = vol_data["vs_hist"]    and vol_data["vs_hist"]    >= VOL_HIST_MULT_T1
+        session_surge = vol_data["vs_session"] and vol_data["vs_session"] >= VOL_SESSION_MULT_T1
+        return hist_surge or session_surge   # either triggers on core
+    else:
+        # Tier 2: BOTH baselines must confirm at elevated thresholds
+        hist_surge    = vol_data["vs_hist"]    and vol_data["vs_hist"]    >= VOL_HIST_MULT_T2
+        session_surge = vol_data["vs_session"] and vol_data["vs_session"] >= VOL_SESSION_MULT_T2
+        return hist_surge and session_surge  # both required on extended
 
 # ─────────────────────────────────────────────────────────────
 # PRICE VELOCITY
@@ -403,24 +412,53 @@ def volume_is_surging(vol_data, tier=1):
 
 def check_price_velocity(closed_bars, atr, window=3, threshold_pct=0.25):
     """
-    Rolling window check: did price move threshold_pct of ATR in last N bars?
-    Returns (fired, move_dollars, move_pct_atr, direction) or (False,...)
+    Multi-window rolling check: catches moves at different speeds.
+    Checks 2-bar (fastest), 3-bar (standard), 5-bar (sustained) simultaneously.
+    Fires on whichever window triggers first.
+    Returns (fired, move_dollars, move_pct_atr, direction, window_used)
     """
-    if len(closed_bars) < window:
-        return False, 0, 0, None
+    windows_to_check = [w for w in [2, 3, 5] if len(closed_bars) >= w]
+    for w in windows_to_check:
+        window_bars = closed_bars[-w:]
+        high = max(b["h"] for b in window_bars)
+        low  = min(b["l"] for b in window_bars)
+        move = high - low
+        # 5-bar window uses 1.5x threshold to avoid wide-ranging day false fires
+        scale = 1.5 if w == 5 else 1.0
+        if move >= atr * threshold_pct * scale:
+            direction = "🟢 LONG" if window_bars[-1]["c"] > window_bars[0]["o"] else "🔴 SHORT"
+            pct_atr   = round(move / atr * 100, 1)
+            return True, round(move, 2), pct_atr, direction, w
+    return False, 0, 0, None, 0
 
-    window_bars = closed_bars[-window:]
-    high = max(b["h"] for b in window_bars)
-    low  = min(b["l"] for b in window_bars)
-    move = high - low
-
-    if move < atr * threshold_pct:
-        return False, 0, 0, None
-
-    # Direction: did we close higher or lower than window open?
-    direction = "🟢 LONG" if window_bars[-1]["c"] > window_bars[0]["o"] else "🔴 SHORT"
-    pct_atr   = round(move / atr * 100, 1)
-    return True, round(move, 2), pct_atr, direction
+def check_range_expansion(closed_bars, atr):
+    """
+    Flat-to-vertical: consolidation followed by sharp expansion.
+    Quiet gate widened to 35% ATR so high-ATR mega-caps (META, AMZN) are caught.
+    META $8 quiet range on $29.50 ATR = 27% — now passes the 35% gate.
+    Returns (fired, quiet_range, accel_move, vol_mult, direction)
+    """
+    if len(closed_bars) < 13:
+        return False, 0, 0, 0, None
+    quiet_bars = closed_bars[-13:-3]
+    accel_bars = closed_bars[-3:]
+    quiet_high  = max(b["h"] for b in quiet_bars)
+    quiet_low   = min(b["l"] for b in quiet_bars)
+    quiet_range = quiet_high - quiet_low
+    if quiet_range >= atr * 0.35:
+        return False, 0, 0, 0, None
+    accel_high = max(b["h"] for b in accel_bars)
+    accel_low  = min(b["l"] for b in accel_bars)
+    accel_move = accel_high - accel_low
+    if accel_move < atr * 0.25:
+        return False, 0, 0, 0, None
+    avg_quiet_vol = sum(b["v"] for b in quiet_bars) / len(quiet_bars)
+    avg_accel_vol = sum(b["v"] for b in accel_bars) / len(accel_bars)
+    if avg_quiet_vol == 0 or avg_accel_vol < avg_quiet_vol * 2.0:
+        return False, 0, 0, 0, None
+    vol_mult  = round(avg_accel_vol / avg_quiet_vol, 1)
+    direction = "🟢 LONG" if accel_bars[-1]["c"] > quiet_high else "🔴 SHORT"
+    return True, round(quiet_range, 2), round(accel_move, 2), vol_mult, direction
 
 # ─────────────────────────────────────────────────────────────
 # DETECTOR 4 — AFTERNOON HOD / ATH BREAKOUT
@@ -441,16 +479,19 @@ def get_52w_high(ticker):
     except Exception:
         return None
 
-def check_hod_breakout(closed_rh_bars, cur_price, atr, w52_high=None):
+def check_hod_breakout(closed_rh_bars, cur_price, atr, w52_high=None, tier=1):
     """
     Returns (fired, hod_price, vol_expanding, pct_above_hod, velocity_pct_atr) or (False,...)
 
     FIRES when ANY of these are true after 12 PM:
       A) ATH territory (within 2% of 52w high) + new HOD close — no volume req
-      B) New HOD + velocity (moved 25%+ ATR in last 3 bars) — price is the signal
+      B) New HOD + velocity (Tier 1: 25%+ ATR | Tier 2: 50%+ ATR) — price is the signal
       C) New HOD + volume expanding 20%+ above recent 10-bar avg — classic breakout
 
-    This catches the ASTS scenario: $5 move to ATH on moderate volume —
+    Tier 2 extended names require Tier 1 energy: velocity threshold doubles,
+    vol expansion still applies the same way (it's already a relative check).
+    ATH territory always fires regardless of tier — price discovery at ATH is never noise.
+    
     price structure at all-time highs IS the signal regardless of vol.
     """
     now = datetime.now(tz=ET)
@@ -479,11 +520,12 @@ def check_hod_breakout(closed_rh_bars, cur_price, atr, w52_high=None):
     cur_vol        = closed_rh_bars[-1]["v"]
     vol_expanding  = avg_recent_vol > 0 and cur_vol >= avg_recent_vol * 1.2
 
-    # Velocity check: moved 25%+ of ATR in last 3 bars
+    # Velocity check — Tier 2 must clear the higher bar (same as scan_ticker vel_thresh)
+    vel_threshold = VELOCITY_PCT_T1 * 100 if tier == 1 else VELOCITY_PCT_T2 * 100  # convert to pct
     window_bars   = closed_rh_bars[-3:]
     window_move   = max(b["h"] for b in window_bars) - min(b["l"] for b in window_bars)
     velocity_pct  = round(window_move / atr * 100, 1) if atr else 0
-    vel_confirmed = velocity_pct >= 25.0
+    vel_confirmed = velocity_pct >= vel_threshold
 
     # ATH territory check
     is_ath_zone = w52_high and cur_price >= w52_high * 0.98
@@ -635,17 +677,41 @@ class MomentumScanner:
             vol_data = analyze_volume(cur_bar, closed, hist_vol, cur_price)
             vol_surge = volume_is_surging(vol_data, tier)
 
-            # ── Price velocity ────────────────────────────────
-            vel_fired, move_dollars, pct_atr, direction = check_price_velocity(
+            # ── Price velocity (multi-window) ─────────────────
+            vel_fired, move_dollars, pct_atr, direction, vel_window = check_price_velocity(
                 closed, atr, window=3, threshold_pct=vel_thresh
             )
+
+            # ── Range expansion (flat-to-vertical) ───────────
+            rng_fired, quiet_range, accel_move, vol_mult, rng_direction = check_range_expansion(
+                closed, atr
+            )
+            if rng_fired and not vel_fired:
+                # Range expansion fires independently — not double-counted with velocity
+                key = f"{ticker}:RANGE_EXP"
+                if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl):
+                    now_re = datetime.now(tz=ET)
+                    dv  = fmt_dollar(vol_data["dollar_vol"])
+                    vss = f"{vol_data['vs_session']:.1f}x" if vol_data["vs_session"] else "N/A"
+                    pct_atr_re = round(accel_move / atr * 100, 1)
+                    msg = (
+                        f"⚡ <b>{ticker} — FLAT-TO-VERTICAL</b>  {rng_direction}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Was ranging ${quiet_range:.2f} for 10+ bars → exploded ${accel_move:.2f} ({pct_atr_re}% ATR)\n"
+                        f"📊 Vol: {vol_mult}x vs quiet period | Dollar vol: {dv}\n"
+                        f"📈 Vol vs session: {vss} | Price: ${cur_price:.2f}\n"
+                        f"📐 21d ATR: ${atr:.2f}  |  {'Core' if tier==1 else 'Extended'}\n"
+                        f"⏰ {now_re.strftime('%I:%M %p ET')}"
+                    )
+                    send_alert(msg)
+                    print(f"[RANGE_EXP] {ticker} T{tier} — quiet ${quiet_range:.2f} → accel ${accel_move:.2f}, vol {vol_mult}x")
 
             now = datetime.now(tz=ET)
 
             # ── TRIGGER 4: Afternoon HOD / ATH Breakout ───────
             w52 = self.w52_high.get(ticker)
             hod_fired, session_hod, vol_expanding, pct_above, velocity_pct = check_hod_breakout(
-                closed, cur_price, atr, w52_high=w52
+                closed, cur_price, atr, w52_high=w52, tier=tier
             )
             if hod_fired:
                 is_ath = w52 and cur_price >= w52 * 0.98
@@ -705,13 +771,14 @@ class MomentumScanner:
             if vel_fired:
                 key = f"{ticker}:VELOCITY"
                 if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl):
+                    bar_label = f"{vel_window * (2 if tier == 1 else 5)}-min"
                     msg = build_alert(
-                        "PRICE VELOCITY", "📈",
+                        f"PRICE VELOCITY ({bar_label})", "📈",
                         ticker, tier, cur_price, move_dollars, pct_atr,
                         direction, vol_data, atr, now
                     )
                     send_alert(msg)
-                    print(f"[VELOCITY] {ticker} T{tier} — ${move_dollars} in 3 bars, {pct_atr}% ATR")
+                    print(f"[VELOCITY] {ticker} T{tier} — ${move_dollars} in {vel_window} bars ({bar_label}), {pct_atr}% ATR")
 
             # ── TRIGGER 2: Volume Surge only ──────────────────
             elif vol_surge:
