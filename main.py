@@ -44,9 +44,10 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DISCORD_URL      = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 SCAN_INTERVAL    = 60       # seconds between full scans
-DEDUP_TTL        = 300      # 5 min dedup window per alert
-PRICE_GATE_PCT   = 0.003    # 0.3% price move to re-alert same level
-REFIRE_MINUTES   = 20       # confirmed move refire window
+DEDUP_TTL_T1     = 600      # 10 min dedup — core names (2-min bars, moves fast)
+DEDUP_TTL_T2     = 1800     # 30 min dedup — extended names (don't re-spam same ticker)
+PRICE_GATE_PCT   = 0.005    # 0.5% price move required to re-alert same level
+REFIRE_MINUTES   = 30       # confirmed move refire window
 
 # Dollar volume minimums per tier (filters thin tape)
 MIN_DOLLAR_VOL_T1 = 10_000_000   # $10M per 2-min bar  — core names
@@ -336,7 +337,7 @@ class Dedup:
     def __init__(self):
         self._store = {}  # key -> (timestamp, price)
 
-    def should_fire(self, key, price, ttl=DEDUP_TTL):
+    def should_fire(self, key, price, ttl=DEDUP_TTL_T1):
         now = time.time()
         if key in self._store:
             last_ts, last_px = self._store[key]
@@ -422,6 +423,78 @@ def check_price_velocity(closed_bars, atr, window=3, threshold_pct=0.25):
     return True, round(move, 2), pct_atr, direction
 
 # ─────────────────────────────────────────────────────────────
+# DETECTOR 4 — AFTERNOON HOD / ATH BREAKOUT
+# ─────────────────────────────────────────────────────────────
+
+def get_52w_high(ticker):
+    """Fetch 52-week high from daily candles."""
+    try:
+        data = _get(f"/pricehistory?symbol={ticker}", {
+            "periodType":    "year", "period": 1,
+            "frequencyType": "daily", "frequency": 1,
+            "needExtendedHoursData": "false",
+        })
+        bars = data.get("candles", [])
+        if not bars:
+            return None
+        return max(b["high"] for b in bars)
+    except Exception:
+        return None
+
+def check_hod_breakout(closed_rh_bars, cur_price, atr, w52_high=None):
+    """
+    Returns (fired, hod_price, vol_expanding, pct_above_hod, velocity_pct_atr) or (False,...)
+
+    FIRES when ANY of these are true after 12 PM:
+      A) ATH territory (within 2% of 52w high) + new HOD close — no volume req
+      B) New HOD + velocity (moved 25%+ ATR in last 3 bars) — price is the signal
+      C) New HOD + volume expanding 20%+ above recent 10-bar avg — classic breakout
+
+    This catches the ASTS scenario: $5 move to ATH on moderate volume —
+    price structure at all-time highs IS the signal regardless of vol.
+    """
+    now = datetime.now(tz=ET)
+    if now.hour < 12:
+        return False, 0, False, 0, 0
+
+    if len(closed_rh_bars) < 12:
+        return False, 0, False, 0, 0
+
+    prior_bars  = closed_rh_bars[:-1]
+    session_hod = max(b["h"] for b in prior_bars)
+
+    # Must close above prior HOD
+    if cur_price <= session_hod:
+        return False, 0, False, 0, 0
+
+    pct_above = round((cur_price - session_hod) / session_hod * 100, 3)
+
+    # Must clear HOD by at least 0.1% — filters flat tape noise
+    if pct_above < 0.10:
+        return False, 0, False, 0, 0
+
+    # Volume expansion check
+    lookback      = prior_bars[-10:]
+    avg_recent_vol = sum(b["v"] for b in lookback) / len(lookback) if lookback else 0
+    cur_vol        = closed_rh_bars[-1]["v"]
+    vol_expanding  = avg_recent_vol > 0 and cur_vol >= avg_recent_vol * 1.2
+
+    # Velocity check: moved 25%+ of ATR in last 3 bars
+    window_bars   = closed_rh_bars[-3:]
+    window_move   = max(b["h"] for b in window_bars) - min(b["l"] for b in window_bars)
+    velocity_pct  = round(window_move / atr * 100, 1) if atr else 0
+    vel_confirmed = velocity_pct >= 25.0
+
+    # ATH territory check
+    is_ath_zone = w52_high and cur_price >= w52_high * 0.98
+
+    # Gate: needs at least ONE of (ATH zone, velocity, vol expanding) to fire
+    if not any([is_ath_zone, vel_confirmed, vol_expanding]):
+        return False, 0, False, 0, 0
+
+    return True, round(session_hod, 2), vol_expanding, pct_above, velocity_pct
+
+# ─────────────────────────────────────────────────────────────
 # ALERT BUILDERS
 # ─────────────────────────────────────────────────────────────
 
@@ -469,6 +542,7 @@ class MomentumScanner:
         self.dedup         = Dedup()
         self.datr          = {}   # ticker -> 21d ATR
         self.hist_vol      = {}   # ticker -> historical avg bar vol
+        self.w52_high      = {}   # ticker -> 52-week high (cached daily)
         self._cache_date   = None
         self.refire_ts     = {}   # key -> last fire timestamp
 
@@ -511,6 +585,11 @@ class MomentumScanner:
             if hv:
                 self.hist_vol[ticker] = hv
 
+            # 52-week high for ATH detection
+            w52 = get_52w_high(ticker)
+            if w52:
+                self.w52_high[ticker] = w52
+
             time.sleep(0.3)
 
         self.dedup.clear()
@@ -533,8 +612,13 @@ class MomentumScanner:
         if not atr:
             return
 
-        bar_min   = 2 if tier == 1 else 5
+        # Suppress all alerts during MOC window — closing flow makes everything look like a surge
+        if self.is_moc_window():
+            return
+
+        bar_min    = 2 if tier == 1 else 5
         vel_thresh = VELOCITY_PCT_T1 if tier == 1 else VELOCITY_PCT_T2
+        dedup_ttl  = DEDUP_TTL_T1   if tier == 1 else DEDUP_TTL_T2
 
         try:
             cs     = candles(ticker, bar_min)
@@ -558,10 +642,56 @@ class MomentumScanner:
 
             now = datetime.now(tz=ET)
 
+            # ── TRIGGER 4: Afternoon HOD / ATH Breakout ───────
+            w52 = self.w52_high.get(ticker)
+            hod_fired, session_hod, vol_expanding, pct_above, velocity_pct = check_hod_breakout(
+                closed, cur_price, atr, w52_high=w52
+            )
+            if hod_fired:
+                is_ath = w52 and cur_price >= w52 * 0.98
+
+                label  = "ATH BREAKOUT 🚨" if is_ath else "NEW HIGH OF DAY"
+                emoji  = "🚀🚀" if is_ath else "🚀"
+
+                # Build confirmation tags — show what triggered it
+                confirms = []
+                if is_ath:
+                    confirms.append("ATH territory")
+                if velocity_pct >= 25:
+                    confirms.append(f"velocity {velocity_pct}% ATR")
+                if vol_expanding:
+                    confirms.append("vol expanding")
+                confirm_str = " | ".join(confirms) if confirms else "HOD break"
+
+                open_price = closed[0]["o"] if closed else cur_price
+                day_move   = round(cur_price - open_price, 2)
+                day_pct    = round(day_move / open_price * 100, 2) if open_price else 0
+
+                dv  = fmt_dollar(vol_data["dollar_vol"])
+                vss = f"{vol_data['vs_session']:.1f}x today avg" if vol_data["vs_session"] else "N/A"
+
+                ath_line = f"🏔 52w High: ${w52:.2f} | Price: {pct_above:.2f}% into ATH zone\n" if is_ath else ""
+
+                key = f"{ticker}:HOD:{round(cur_price, 1)}"
+                if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl):
+                    msg = (
+                        f"{emoji} <b>{ticker} — {label}</b>  🟢 LONG\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Prior HOD: ${session_hod:.2f} → Now: ${cur_price:.2f} (+{pct_above:.2f}%)\n"
+                        f"📈 Day move: ${day_move:+.2f} ({day_pct:+.2f}%)\n"
+                        f"{ath_line}"
+                        f"✅ Triggered by: {confirm_str}\n"
+                        f"💰 Dollar vol this bar: {dv} | {vss}\n"
+                        f"📐 21d ATR: ${atr:.2f}  |  {'Core' if tier==1 else 'Extended'}\n"
+                        f"⏰ {now.strftime('%I:%M %p ET')}"
+                    )
+                    send_alert(msg)
+                    print(f"[HOD{'*ATH' if is_ath else ''}] {ticker} — broke ${session_hod:.2f} → ${cur_price:.2f} | {confirm_str}")
+
             # ── TRIGGER 3: Confirmed Move (both) ──────────────
             if vel_fired and vol_surge:
                 key = f"{ticker}:CONFIRMED"
-                if self.dedup.should_fire(key, cur_price) and self._refire_ok(key):
+                if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl) and self._refire_ok(key):
                     msg = build_alert(
                         "CONFIRMED MOVE", "🔥🔥",
                         ticker, tier, cur_price, move_dollars, pct_atr,
@@ -574,7 +704,7 @@ class MomentumScanner:
             # ── TRIGGER 1: Price Velocity only ───────────────
             if vel_fired:
                 key = f"{ticker}:VELOCITY"
-                if self.dedup.should_fire(key, cur_price):
+                if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl):
                     msg = build_alert(
                         "PRICE VELOCITY", "📈",
                         ticker, tier, cur_price, move_dollars, pct_atr,
@@ -586,7 +716,7 @@ class MomentumScanner:
             # ── TRIGGER 2: Volume Surge only ──────────────────
             elif vol_surge:
                 key = f"{ticker}:VOLUME"
-                if self.dedup.should_fire(key, cur_price):
+                if self.dedup.should_fire(key, cur_price, ttl=dedup_ttl):
                     # Compute price change from session open for context
                     open_price = closed[0]["o"] if closed else cur_price
                     open_move  = round(cur_price - open_price, 2)
@@ -620,6 +750,12 @@ class MomentumScanner:
             return False
         t = now.hour * 60 + now.minute
         return 9 * 60 + 25 <= t < 16 * 60
+
+    def is_moc_window(self):
+        """Suppress alerts 3:30–4:00 PM — MOC order flow makes every stock look like it's surging."""
+        now = datetime.now(tz=ET)
+        t = now.hour * 60 + now.minute
+        return t >= 15 * 60 + 30   # 3:30 PM ET onward
 
     def run(self):
         print("[MOMv2] Scanner starting...")
@@ -681,11 +817,13 @@ def poll_telegram(scanner):
                     sym = text.split(None, 1)[1].upper().strip()
                     if sym not in scanner.manual_watch:
                         scanner.manual_watch.append(sym)
-                        # Immediately fetch ATR + hist vol for new name
+                        # Immediately fetch ATR + hist vol + 52w high for new name
                         atr = daily_atr21(sym)
                         hv  = daily_avg_bar_vol(sym, 2)
-                        if atr: scanner.datr[sym] = atr
+                        w52 = get_52w_high(sym)
+                        if atr: scanner.datr[sym]     = atr
                         if hv:  scanner.hist_vol[sym] = hv
+                        if w52: scanner.w52_high[sym] = w52
                         send_telegram(
                             f"✅ <b>{sym}</b> added to Tier 1 watch\n"
                             f"ATR: ${atr:.2f}" if atr else f"✅ <b>{sym}</b> added (ATR fetch failed)"
